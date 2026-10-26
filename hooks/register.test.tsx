@@ -62,7 +62,7 @@ const engine = (on: Parameters<TestBody>[1], { files = SKILLS_REPO, stored }: Wo
 
     return { value: undefined }
   })
-  on('session.usage', () => ({ value: { startedAt: 0, context: { window: 200_000 }, rateLimits: [] } }))
+  on('session.usage', () => ({ value: { startedAt: 0, context: { tokens: 50_000, window: 200_000 }, rateLimits: [] } }))
   on('clock.now', () => ({ value: 1 }))
   on('fs.read', (_, e) => ({ value: disk.get(rel(e.path))?.text ?? '' }))
   on('fs.exists', (_, e) => ({ value: disk.has(rel(e.path)) }))
@@ -140,15 +140,53 @@ test('progress saved by 0.2 carries over: its steps passed, its rounds finished 
   await ui.unmount()
 })
 
-test('a skill run moves the guide on, and the button types the next command', async ($, on) => {
-  const { filled } = engine(on)
-  await $.session.start({ cwd: REPO, surface: 'terminal', isInteractive: true })
+test('a skill the person types moves the guide on', async ($, on) => {
+  engine(on)
+  await start($)
   await typed($, 'mattpocock-skills:grill-with-docs')
 
+  expect(await seen($, /▶/)).toBe('▶ 3. 動手做')
+})
+
+test('the pane is a dashboard on every surface: the card offers skip and stuck, nothing that runs or ticks a step', async ($, on) => {
+  engine(on)
+  await start($)
+  await turnEnds($)
+
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect(await ui.find({ key: 'skip' })).toBeDefined()
+    expect(await ui.find({ key: 'stuck' })).toBeDefined()
+    expect(await ui.find({ key: 'fill' })).toBeUndefined()
+    expect(await ui.find({ key: 'mark' })).toBeUndefined()
+    expect(await ui.find({ key: 'level-expert' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /50k \/ 150k/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /已完成 0 個功能/ })).toBeDefined()
+    await ui.unmount()
+  }
+})
+
+test('skip on the pane works like /matt-flow skip, and a skipped step looks unlike a passed one', async ($, on) => {
+  const { toasts } = engine(on)
+  await start($)
+  await typed($, 'grill-with-docs')
+
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect((await ui.find({ type: 'Text', text: /▶/ }))?.text).toBe('▶ 3. 動手做')
-  await ui.press({ key: 'fill' })
-  expect(filled).toEqual(['/implement'])
+  await ui.press({ key: 'skip' })
+  expect(toasts.at(-1)).toBe('↷ 跳過「動手做」→ 下一步 /code-review')
+  expect((await ui.find({ type: 'Text', text: /把想法問清楚/ }))?.text).toBe('✔ 2. 把想法問清楚')
+  expect((await ui.find({ type: 'Text', text: /動手做/ }))?.text).toBe('↷ 3. 動手做（跳過）')
+  expect((await ui.find({ type: 'Text', text: /▶/ }))?.text).toBe('▶ 4. 檢查')
+  await ui.unmount()
+})
+
+test('stuck fills /ask-matt with where the person is', async ($, on) => {
+  const { filled } = engine(on)
+  await start($)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'stuck' })
+  expect(filled).toEqual(['/ask-matt 我在 Matt 導航的「新手」流程，卡在「把想法問清楚」(/grill-with-docs)。我遇到的狀況是：'])
   await ui.unmount()
 })
 

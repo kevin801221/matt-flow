@@ -376,12 +376,6 @@ async function setOff($: EngineInterface, isOff: boolean) {
   return (await quietLine($)) ?? `軌道打開了 → 下一步 ${await nextCommand($)}`
 }
 
-async function markDone($: EngineInterface, key: StepKey) {
-  await pass($, [key])
-  await save($)
-  await refreshStatus($)
-}
-
 async function setLevel($: EngineInterface, lv: Level) {
   await update($, progress, p => ({ ...p, level: lv }))
   await save($)
@@ -392,10 +386,6 @@ async function askMatt($: EngineInterface, lv: Level, key: StepKey) {
   await $.prompt.fill({
     text: `/ask-matt 我在 Matt 導航的「${LEVELS[lv].name}」流程，卡在「${STEPS[key].title}」(${STEPS[key].command})。我遇到的狀況是：`,
   })
-}
-
-async function fillCommand($: EngineInterface, command: string) {
-  await $.prompt.fill({ text: command })
 }
 
 // `rel` is the written file's path relative to the repo root.
@@ -547,6 +537,7 @@ export const register: Register = on => {
     const setUp = await read($, isSetUp)
     const fill = await read($, tokens)
     const pending = await read($, unsynced)
+    const quiet = await quietLine($)
     const track = LEVELS[lv]
     const current = currentStep(p, setUp)
     const count = track.steps.filter(key => stateOf(p, key, setUp)).length
@@ -584,7 +575,14 @@ export const register: Register = on => {
           </Text>
         </Box>
 
-        <Text bold>{featureLine(p)}</Text>
+        <Box flexDirection="column">
+          <Text bold>{featureLine(p)}</Text>
+          {quiet !== undefined && (
+            <Text color="warning" wrap="wrap">
+              {quiet}
+            </Text>
+          )}
+        </Box>
 
         <Box gap={1}>
           <Text color="success">{'█'.repeat(filled)}</Text>
@@ -595,7 +593,7 @@ export const register: Register = on => {
         <Box flexDirection="column">
           {track.steps.map((key, i) => {
             const step = STEPS[key]
-            const isDone = stateOf(p, key, setUp) !== undefined
+            const state = stateOf(p, key, setUp)
 
             return key === current ? (
               <Box
@@ -610,22 +608,23 @@ export const register: Register = on => {
                 <Text wrap="wrap">{step.what}</Text>
                 <Text italic color="subtle" wrap="wrap">{`💡 ${step.tip}`}</Text>
                 <Box gap={1} flexWrap="wrap" marginTop={1}>
-                  <Button key="fill" hotkey="1" variant="primary" onPress={() => fillCommand($, step.command)}>
-                    ⏎ 填入指令
+                  <Button key="skip" hotkey="1" onPress={async () => $.ui.toast(await skipStep($))}>
+                    ↷ 跳過
                   </Button>
-                  <Button key="mark" hotkey="2" onPress={() => markDone($, key)}>
-                    ✓ 做完了
-                  </Button>
-                  <Button key="stuck" hotkey="3" dimColor onPress={() => askMatt($, lv, key)}>
+                  <Button key="stuck" hotkey="2" dimColor onPress={() => askMatt($, lv, key)}>
                     ? 我卡住了
                   </Button>
                 </Box>
               </Box>
             ) : (
               <Box key={key} justifyContent="space-between" paddingX={1}>
-                <Text color={isDone ? 'success' : undefined} dimColor={!isDone}>
-                  {`${isDone ? '✔' : '○'} ${i + 1}. ${step.title}`}
-                </Text>
+                {state === 'passed' ? (
+                  <Text color="success">{`✔ ${i + 1}. ${step.title}`}</Text>
+                ) : state === 'skipped' ? (
+                  <Text color="warning" dimColor>{`↷ ${i + 1}. ${step.title}（跳過）`}</Text>
+                ) : (
+                  <Text dimColor>{`○ ${i + 1}. ${step.title}`}</Text>
+                )}
                 <Text dimColor>{step.command}</Text>
               </Box>
             )
