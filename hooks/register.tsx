@@ -135,8 +135,14 @@ const mark = (p: Progress, keys: StepKey[], state: StepState): Progress => ({
   steps: { ...p.steps, ...Object.fromEntries(keys.map(key => [key, state] as const)) },
 })
 const isBuilding = (p: Progress) => BUILD.some(key => p.steps[key])
+// The step whose command unlocks code: grilling without a feature, else the one it stands on.
+const unlockStep = (p: Progress) => (p.feature && currentStep(p, true)) || 'grill'
 // A `git commit`, however git is pointed (`git -C dir commit`).
 const GIT_COMMIT = /\bgit(?:\s+-[cC]\s+\S+)*\s+commit\b/
+// Beginners and intermediates commit what they build only after code-review has run.
+const isCommitLocked = (p: Progress) => p.level !== 'expert' && isBuilding(p) && !p.isReviewed
+const featureLine = ({ feature }: Progress) =>
+  feature === null ? '還沒有進行中的功能' : feature.name === null ? '功能進行中，還沒有規格' : `功能「${feature.name}」進行中`
 // What the rail guards: a project file that is not markdown, outside the tracker's folder and docs.
 // ponytail: `..` is not resolved; the gate keeps Claude on the flow, it is no sandbox (Bash gets past it anyway).
 const isCode = (cwd: string, path: string) =>
@@ -272,22 +278,45 @@ async function codeGate($: EngineInterface, path: string) {
   const cwd = await read($, project)
   const p = await read($, progress)
   if (cwd === null || !isCode(cwd, path) || isBuilding(p) || (await isQuiet($))) return undefined
-  // Without a feature it is grilling; during one, the step it stands on.
-  const key = (p.feature && currentStep(p, true)) || 'grill'
+  const key = unlockStep(p)
   suggestion = STEPS[key].command
 
   return `matt-flow：還沒到動手做，程式碼鎖著。目前的步驟是「${STEPS[key].title}」，解鎖要由人輸入 ${suggestion}（已預填在輸入框）。停下來交棒：把這個指令告訴人，然後結束這一輪。不要改用 Bash 或其他方式寫這個檔案。`
 }
 
-// Why running `command` is denied, or undefined while it may go ahead: beginners
-// and intermediates commit what they build only after code-review has run.
+// Why running `command` is denied, or undefined while it may go ahead.
 async function commitGate($: EngineInterface, command: string) {
-  const p = await read($, progress)
-  if (!GIT_COMMIT.test(command) || p.level === 'expert' || !isBuilding(p) || p.isReviewed || (await isQuiet($))) {
-    return undefined
-  }
+  if (!GIT_COMMIT.test(command) || !isCommitLocked(await read($, progress)) || (await isQuiet($))) return undefined
 
   return 'matt-flow：這次動手做還沒跑過 code-review，先不能 commit。先用 Skill 工具跑 code-review（或請人輸入 /code-review），跑過之後的 commit 都會放行。不要繞過這個阻擋。'
+}
+
+// Claude's own map of the rail, last in its system prompt: where the flow
+// stands, what is locked and how it unlocks, and how to hand over.
+async function railPrompt($: EngineInterface) {
+  if (await isQuiet($)) return undefined
+  const p = await read($, progress)
+  const step = STEPS[currentStep(p, true) ?? 'grill']
+  const locks = [
+    ...(isBuilding(p) ? [] : [`改程式碼（Edit、Write、NotebookEdit）：由人輸入 ${STEPS[unlockStep(p)].command} 解鎖`]),
+    ...(isCommitLocked(p) ? ['git commit：先跑 code-review（Skill 工具，或請人輸入 /code-review）'] : []),
+  ]
+
+  return [
+    '# matt-flow 軌道',
+    '',
+    '這個專案照 Matt Pocock 的流程走，由 matt-flow 把關，人輸入每一步的指令。',
+    `- ${featureLine(p)}`,
+    `- 等級：${LEVELS[p.level].name}`,
+    `- 目前的步驟：${step.title}（${step.command}）`,
+    `- 現在會被擋的動作：${locks.length === 0 ? '沒有' : ''}`,
+    ...locks.map(lock => `  - ${lock}`),
+    '',
+    '規矩：',
+    `- 交棒：做完人這次啟動的工作，或動作被擋下時，就停下來，把下一步的指令（現在是 ${step.command}）告訴人，然後結束這一輪；由人輸入，不要自己往下做。`,
+    '- 除了下一步的指令，不要建議其他流程指令。',
+    '- 絕不繞過任何阻擋，包括改用 Bash 寫檔或 commit。',
+  ].join('\n')
 }
 
 async function markDone($: EngineInterface, key: StepKey) {
@@ -417,6 +446,13 @@ export const register: Register = on => {
     return ran
   })
 
+  on('prompt.compose', async ($, e, next) => {
+    const composed = await next(e)
+    const text = await railPrompt($)
+
+    return text === undefined ? composed : { sections: [...composed.sections, { id: 'matt-flow:rail', text, scope: 'session' }] }
+  })
+
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
     const locked = await commitGate($, e.command)
 
@@ -473,13 +509,7 @@ export const register: Register = on => {
           </Text>
         </Box>
 
-        <Text bold>
-          {p.feature === null
-            ? '還沒有進行中的功能'
-            : p.feature.name === null
-              ? '功能進行中，還沒有規格'
-              : `功能「${p.feature.name}」進行中`}
-        </Text>
+        <Text bold>{featureLine(p)}</Text>
 
         <Box gap={1}>
           <Text color="success">{'█'.repeat(filled)}</Text>

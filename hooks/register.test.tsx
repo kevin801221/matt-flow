@@ -80,6 +80,7 @@ const engine = (on: Parameters<TestBody>[1], { files = SKILLS_REPO, stored }: Wo
     return { isShown: true }
   })
   on('turn.complete', () => ({ text: '' }))
+  on('prompt.compose', () => ({ sections: [{ id: 'intro', text: 'You are Claude Code.', scope: 'shared' }] }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('prompt.submit', (_, e) => ({ text: e.text }))
   on('tool.call', () => ({ result: {} }))
@@ -353,6 +354,72 @@ test('the expert commits freely: /implement-spec reviews its own work', async ($
   for (const skill of ['grill-with-docs', 'to-spec', 'to-tickets', 'implement-spec']) await typed($, skill)
 
   expect((await bash($, 'git commit -m "wip"')).deny).toBeUndefined()
+})
+
+// The rail's section of the system prompt, checked to come last, or undefined.
+const railSection = async ($: Parameters<TestBody>[0]) => {
+  const { sections } = await $.prompt.compose({
+    model: 'claude-opus-5-5',
+    promptModel: 'claude-opus-5-5',
+    surfaces: ['terminal'],
+    tools: ['Edit', 'Bash'],
+    outputStyle: null,
+    traits: [],
+  })
+  const rail = sections.find(section => section.id === 'matt-flow:rail')
+  if (rail) expect(sections.at(-1)).toEqual({ ...rail, scope: 'session' })
+
+  return rail?.text
+}
+
+test('with no feature, the system prompt says code is locked behind /grill-with-docs, and the rules', async ($, on) => {
+  engine(on)
+  await start($)
+
+  const text = await railSection($)
+  expect(text).toMatch(/還沒有進行中的功能/)
+  expect(text).toMatch(/新手/)
+  expect(text).toMatch(/目前的步驟：把想法問清楚（\/grill-with-docs）/)
+  expect(text).toMatch(/改程式碼.*\/grill-with-docs/)
+  expect(text).not.toMatch(/git commit/)
+  expect(text).toMatch(/停下來/)
+  expect(text).toMatch(/不要建議其他流程指令/)
+  expect(text).toMatch(/Bash/)
+})
+
+test('once the spec is written, the system prompt names the feature and points at /to-tickets', async ($, on) => {
+  const { write } = engine(on, { stored: { level: 'intermediate' } })
+  await start($)
+  await typed($, 'grill-with-docs')
+  await typed($, 'to-spec')
+  write('.scratch/rail/spec.md')
+  await turnEnds($)
+
+  const text = await railSection($)
+  expect(text).toMatch(/「rail」/)
+  expect(text).toMatch(/進階/)
+  expect(text).toMatch(/目前的步驟：切成任務卡（\/to-tickets）/)
+  expect(text).toMatch(/改程式碼.*\/to-tickets/)
+})
+
+test('while building, the system prompt locks only the commit, until code-review runs', async ($, on) => {
+  engine(on)
+  await start($)
+  await typed($, 'grill-with-docs')
+  await typed($, 'implement')
+
+  const text = await railSection($)
+  expect(text).not.toMatch(/改程式碼/)
+  expect(text).toMatch(/git commit.*code-review/)
+  await typed($, 'code-review')
+  expect(await railSection($)).toMatch(/現在會被擋的動作：沒有/)
+})
+
+test('a project never set up gets no rail in its system prompt', async ($, on) => {
+  engine(on, { files: {} })
+  await start($)
+
+  expect(await railSection($)).toBeUndefined()
 })
 
 test('an em-dash is denied inside the skills repo only', async ($, on) => {
