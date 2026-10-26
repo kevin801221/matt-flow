@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register } from 'claude-code'
+import type { EngineInterface, FsEntry, Register } from 'claude-code'
 
 import type { Level, Progress, StepState } from '../types'
 
@@ -11,6 +11,8 @@ const SMART_ZONE = 150_000
 const EM_DASH = String.fromCharCode(0x2014)
 // Written by /setup-matt-pocock-skills: a project holding it is set up.
 const SETUP_FILE = 'docs/agents/issue-tracker.md'
+// Where the local markdown tracker keeps a folder per feature.
+const SCRATCH = '.scratch'
 
 type Step = { title: string; command: string; skills: string[]; what: string; tip: string }
 
@@ -18,7 +20,8 @@ const STEPS = {
   setup: {
     title: '設定專案',
     command: '/setup-matt-pocock-skills',
-    skills: ['setup-matt-pocock-skills'],
+    // Passes on SETUP_FILE alone.
+    skills: [] as string[],
     what: '告訴 AI 任務放哪裡（GitHub 或本地檔案）、文件放哪裡。每個專案只要做一次。',
     tip: '做過就會自動打勾，之後每個新功能都從下一步開始。',
   },
@@ -46,7 +49,7 @@ const STEPS = {
   build: {
     title: '動手做',
     command: '/implement',
-    skills: ['implement', 'tdd'],
+    skills: ['implement'],
     what: 'AI 用測試先行的方式一小塊一小塊寫，寫完自己跑 /code-review 再 commit。',
     tip: '任務卡很多的話，一次做一張，每張做完就 /clear。',
   },
@@ -103,6 +106,10 @@ const LEVELS: Record<Level, { icon: string; name: string; goal: string; steps: S
   },
 }
 const ORDER: Level[] = ['beginner', 'intermediate', 'expert']
+// Each level's building: only the person typing its command passes it.
+const BUILD: StepKey[] = ['build', 'parallel']
+// With the local tracker these pass on their files, not on their skill running.
+const ARTIFACTS: StepKey[] = ['spec', 'tickets']
 
 // Editing any of these counts as having synced the skills edited before.
 // ponytail: one touch clears every pending skill; track per-target if that misleads.
@@ -117,12 +124,23 @@ const isSetUp = atom({ plugin: 'matt-flow', key: 'isSetUp' } as const, false)
 const tokens = atom({ plugin: 'matt-flow', key: 'tokens' } as const, null)
 const unsynced = atom({ plugin: 'matt-flow', key: 'unsynced' } as const, [])
 
+// The next step's command, offered in the prompt box once the turn ends.
+let suggestion: string | undefined
+
 const stateOf = (p: Progress, key: StepKey, setUp: boolean): StepState | undefined =>
   key === 'setup' && setUp ? 'passed' : p.steps[key]
 const currentStep = (p: Progress, setUp: boolean) => LEVELS[p.level].steps.find(key => !stateOf(p, key, setUp))
 const mark = (p: Progress, keys: StepKey[], state: StepState): Progress => ({
   ...p,
   steps: { ...p.steps, ...Object.fromEntries(keys.map(key => [key, state] as const)) },
+})
+// Ends the feature: it counts, and every step but setup starts over.
+const finish = (p: Progress): Progress => ({
+  ...p,
+  steps: p.steps.setup ? { setup: p.steps.setup } : {},
+  feature: null,
+  isReviewed: false,
+  features: p.features + 1,
 })
 const bar = (part: number, width: number) => Math.max(0, Math.min(width, Math.round(part * width)))
 
@@ -157,67 +175,94 @@ async function load($: EngineInterface, cwd: string) {
   await update($, progress, () => restore(saved, now))
 }
 
+// The rail stays out of projects never set up, and ones the person turned it off in.
+async function isQuiet($: EngineInterface) {
+  return !(await read($, isSetUp)) || (await read($, progress)).isOff
+}
+
+async function isLocalTracker($: EngineInterface) {
+  const text = await $.fs.read(`${await read($, project)}/${SETUP_FILE}`).catch(() => '')
+
+  return /^# Issue tracker: Local Markdown/im.test(text)
+}
+
+const list = ($: EngineInterface, path: string) => $.fs.list(path).catch((): FsEntry[] => [])
+
 async function refreshStatus($: EngineInterface) {
   const pending = await read($, unsynced)
   if (pending.length > 0) {
     return $.ui.status(`${pending.join(', ')} 改了 → 同步 README · plugin.json · docs · ask-matt`)
   }
   const p = await read($, progress)
-  const setUp = await read($, isSetUp)
-  // Quiet in projects that never took up the flow.
-  if (!setUp && Object.keys(p.steps).length === 0) return $.ui.status(undefined)
-  const key = currentStep(p, setUp)
-  $.ui.status(
-    key
-      ? `✦ ${LEVELS[p.level].icon} 下一步 ${STEPS[key].command} · /matt-flow`
-      : '✦ 🎉 這一輪完成 · /matt-flow',
-  )
+  const key = currentStep(p, await read($, isSetUp))
+  if (key === undefined || (await isQuiet($))) return $.ui.status(undefined)
+  $.ui.status(`✦ ${LEVELS[p.level].icon} 下一步 ${STEPS[key].command} · /matt-flow`)
 }
 
-// Marks the steps a skill run finishes; returns the next step's command, if it moved on.
-async function markSkill($: EngineInterface, skill: string) {
+async function handOver($: EngineInterface, title: string) {
+  const key = currentStep(await read($, progress), await read($, isSetUp))
+  if (key === undefined) return
+  suggestion = STEPS[key].command
+  $.ui.toast(`✔ ${title} 通過 → 下一步 ${suggestion}`)
+}
+
+// Passes the steps not passed or skipped yet and hands over to the next one.
+// Passing the retro ends the feature.
+async function pass($: EngineInterface, keys: StepKey[]) {
   const before = await read($, progress)
-  const fresh = (Object.keys(STEPS) as StepKey[]).filter(
-    key => STEPS[key].skills.includes(skill) && !before.steps[key],
-  )
-  if (fresh.length === 0) return undefined
+  const fresh = keys.filter(key => !before.steps[key])
+  if (fresh.length === 0) return
   await update($, progress, p => mark(p, fresh, 'passed'))
-  await save($)
-  const after = await read($, progress)
-  const key = currentStep(after, await read($, isSetUp))
-  const track = LEVELS[after.level]
-  $.ui.toast(
-    key
-      ? `✔ ${STEPS[fresh[0]!].title} 完成 → 下一步 ${STEPS[key].command}`
-      : `🎉 ${track.icon} ${track.name}流程走完一個功能！輸入 /matt-flow 看看`,
-  )
-
-  return key && STEPS[key].command
+  if (!fresh.includes('retro')) return handOver($, STEPS[fresh[0]!].title)
+  await update($, progress, finish)
+  suggestion = STEPS.grill.command
+  $.ui.toast(`🎉 功能完成！已完成 ${before.features + 1} 個功能 → 下一個從 ${suggestion} 開始`)
 }
 
-// Returns the next step's command, if the skill moved the guide on.
-async function noteSkill($: EngineInterface, name: string) {
+// A skill ran: typed by the person, or run by the model through the Skill tool.
+async function noteSkill($: EngineInterface, name: string, byPerson: boolean) {
   // A plugin's skill arrives as `mattpocock-skills:to-spec`.
-  const command = await markSkill($, name.split(':').pop() ?? name)
+  const skill = name.split(':').pop() ?? name
+  const keys = (Object.keys(STEPS) as StepKey[]).filter(key => STEPS[key].skills.includes(skill))
+  if (keys.length === 0 || (await isQuiet($))) return
+  const now = await $.clock.now()
+  await update($, progress, p => (p.feature ? p : { ...p, feature: { name: null, since: now } }))
+  const isLocal = await isLocalTracker($)
+  await pass($, keys.filter(key => (BUILD.includes(key) ? byPerson : !(isLocal && ARTIFACTS.includes(key)))))
+  await save($)
   await refreshStatus($)
+}
 
-  return command
+// With the local tracker, spec and tickets pass on files written since the
+// feature started: in its own folder once it has a spec, else in any.
+async function checkArtifacts($: EngineInterface) {
+  const p = await read($, progress)
+  if (p.feature === null || (await isQuiet($)) || !(await isLocalTracker($))) return
+  const { name, since } = p.feature
+  const root = `${await read($, project)}/${SCRATCH}`
+  const isNew = (entries: FsEntry[], file: RegExp) =>
+    entries.some(entry => entry.kind === 'file' && file.test(entry.name) && entry.mtimeMs >= since)
+  const folders = name !== null ? [name] : (await list($, root)).filter(entry => entry.kind === 'dir').map(entry => entry.name)
+  for (const folder of folders) {
+    const found: StepKey[] = []
+    if (isNew(await list($, `${root}/${folder}`), /^spec\.md$/)) found.push('spec')
+    if (isNew(await list($, `${root}/${folder}/issues`), /\.md$/)) found.push('tickets')
+    if (found.length === 0) continue
+    // The feature goes by its spec's folder.
+    if (name === null && found.includes('spec')) await update($, progress, q => ({ ...q, feature: { name: folder, since } }))
+
+    return pass($, found)
+  }
 }
 
 async function markDone($: EngineInterface, key: StepKey) {
-  await update($, progress, p => mark(p, [key], 'passed'))
+  await pass($, [key])
   await save($)
   await refreshStatus($)
 }
 
 async function setLevel($: EngineInterface, lv: Level) {
   await update($, progress, p => ({ ...p, level: lv }))
-  await save($)
-  await refreshStatus($)
-}
-
-async function nextRound($: EngineInterface, lv: Level) {
-  await update($, progress, p => ({ ...p, level: lv, steps: {}, feature: null, features: p.features + 1 }))
   await save($)
   await refreshStatus($)
 }
@@ -253,8 +298,6 @@ async function isSkillsRepo($: EngineInterface, cwd: string) {
 
 export const register: Register = on => {
   let repoRoot: string | null = null
-  // The next step's command, offered in the prompt box once the turn ends.
-  let suggestion: string | undefined
 
   const inRepo = (path: string) => repoRoot !== null && path.startsWith(`${repoRoot}/`)
   const denial = (name: string) =>
@@ -286,7 +329,7 @@ export const register: Register = on => {
   // Not `skill.prompt`: the managed security hook skips past user plugins there.
   // A skill the person typed as `/name`.
   on('prompt.submit', async ($, e, next) => {
-    if (e.command) suggestion = (await noteSkill($, e.command.name)) ?? suggestion
+    if (e.command) await noteSkill($, e.command.name, true)
 
     return next(e)
   })
@@ -294,7 +337,7 @@ export const register: Register = on => {
   // A skill the model ran through the Skill tool.
   on('tool.call', { tool: 'Skill' }, async ($, e, next) => {
     const ran = await next(e)
-    if (ran.deny === undefined && !ran.isError) suggestion = (await noteSkill($, e.skill)) ?? suggestion
+    if (ran.deny === undefined && !ran.isError) await noteSkill($, e.skill, false)
 
     return ran
   })
@@ -302,7 +345,11 @@ export const register: Register = on => {
   on('turn.complete', async ($, e, next) => {
     const { context } = await $.session.usage()
     await update($, tokens, () => context.tokens ?? null)
+    const wasSetUp = await read($, isSetUp)
     await checkSetup($)
+    if (!wasSetUp && !(await isQuiet($))) await handOver($, STEPS.setup.title)
+    await checkArtifacts($)
+    await save($)
     await refreshStatus($)
     const ran = await next(e)
     if (suggestion !== undefined) {
@@ -343,7 +390,6 @@ export const register: Register = on => {
     const count = track.steps.filter(key => stateOf(p, key, setUp)).length
     const width = Math.max(8, Math.min(24, (e.props.bodyColumns ?? 40) - 10))
     const filled = bar(count / track.steps.length, width)
-    const higher = ORDER[ORDER.indexOf(lv) + 1]
     const zone = fill === null ? 0 : fill / SMART_ZONE
     const zoneColor = zone >= 1 ? 'error' : zone >= 0.8 ? 'warning' : 'success'
 
@@ -375,6 +421,14 @@ export const register: Register = on => {
             {track.goal}
           </Text>
         </Box>
+
+        <Text bold>
+          {p.feature === null
+            ? '還沒有進行中的功能'
+            : p.feature.name === null
+              ? '功能進行中，還沒有規格'
+              : `功能「${p.feature.name}」進行中`}
+        </Text>
 
         <Box gap={1}>
           <Text color="success">{'█'.repeat(filled)}</Text>
@@ -421,25 +475,6 @@ export const register: Register = on => {
             )
           })}
         </Box>
-
-        {current === undefined && (
-          <Box flexDirection="column" borderStyle="double" borderColor="success" paddingX={1}>
-            <Text bold color="success">
-              🎉 這個功能完成了！
-            </Text>
-            <Text wrap="wrap">{`你已經走完${track.icon} ${track.name}的整套流程，這是第 ${p.features + 1} 個功能。`}</Text>
-            <Box gap={1} flexWrap="wrap" marginTop={1}>
-              <Button key="again" hotkey="1" variant="primary" onPress={() => nextRound($, lv)}>
-                ↻ 做下一個功能
-              </Button>
-              {higher !== undefined && (
-                <Button key="upgrade" hotkey="2" onPress={() => nextRound($, higher)}>
-                  {`${LEVELS[higher].icon} 升級到${LEVELS[higher].name}`}
-                </Button>
-              )}
-            </Box>
-          </Box>
-        )}
 
         {fill !== null && (
           <Box flexDirection="column">
