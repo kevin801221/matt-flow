@@ -145,7 +145,7 @@ const GIT_COMMIT = /\bgit(?:\s+-[cC]\s+\S+)*\s+commit\b/
 // Beginners and intermediates commit what they build only after code-review has run.
 const isCommitLocked = (p: Progress) => p.level !== 'expert' && isBuilding(p) && !p.isReviewed
 const featureLine = ({ feature }: Progress) =>
-  feature === null ? '還沒有進行中的功能' : feature.name === null ? '功能進行中，還沒有規格' : `功能「${feature.name}」進行中`
+  feature === null ? '還沒有進行中的功能' : feature.name === null ? '功能進行中' : `功能「${feature.name}」進行中`
 // What the rail guards: a project file that is not markdown, outside the tracker's folder and docs.
 // ponytail: `..` is not resolved; the gate keeps Claude on the flow, it is no sandbox (Bash gets past it anyway).
 const isCode = (cwd: string, path: string) =>

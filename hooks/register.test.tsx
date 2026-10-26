@@ -139,6 +139,8 @@ test('progress saved by 0.2 carries over: its steps passed, its rounds finished 
   expect((await ui.find({ type: 'Text', text: /把想法問清楚/ }))?.text).toBe('✔ 2. 把想法問清楚')
   expect((await ui.find({ type: 'Text', text: /▶/ }))?.text).toBe('▶ 4. 切成任務卡')
   expect(await ui.find({ type: 'Text', text: /已完成 2 個功能/ })).toBeDefined()
+  // Its spec passed with no folder on record to name the feature by.
+  expect((await ui.find({ type: 'Text', text: /進行中/ }))?.text).toBe('功能進行中')
   await ui.unmount()
 })
 
@@ -227,7 +229,7 @@ test('a flow skill starts a feature, and the retro ends it: it counts, and the n
   expect(await seen($, /進行中/)).toBe('還沒有進行中的功能')
 
   await typed($, 'grill-with-docs')
-  expect(await seen($, /進行中/)).toBe('功能進行中，還沒有規格')
+  expect(await seen($, /進行中/)).toBe('功能進行中')
   for (const skill of ['implement', 'code-review', 'retro']) await typed($, skill)
 
   expect(await seen($, /已完成/)).toMatch(/已完成 1 個功能/)
@@ -314,6 +316,8 @@ test('on the GitHub tracker, spec and tickets pass when their skills run', async
   for (const skill of ['grill-with-docs', 'to-spec', 'to-tickets']) await typed($, skill)
 
   expect(await seen($, /▶/)).toBe('▶ 5. 動手做')
+  // The spec passed, though no folder names the feature.
+  expect(await seen($, /進行中/)).toBe('功能進行中')
 })
 
 test('a project set up this turn hands over to grilling', async ($, on) => {
@@ -568,7 +572,7 @@ test('/matt-flow skip skips the step the flow stands on, and says what is next',
   await start($)
 
   expect(await flow($, 'skip')).toBe('↷ 跳過「把想法問清楚」→ 下一步 /implement')
-  expect(await seen($, /進行中/)).toBe('功能進行中，還沒有規格')
+  expect(await seen($, /進行中/)).toBe('功能進行中')
   expect((await edit($, 'src/app.ts')).deny).toMatch(/\/implement/)
   expect(await flow($, 'skip')).toBe('↷ 跳過「動手做」→ 下一步 /code-review')
   expect((await edit($, 'src/app.ts')).deny).toBeUndefined()
