@@ -1,0 +1,6 @@
+{
+  "name": "matt-flow",
+  "version": "0.2.0",
+  "description": "Matt 導航: a pane that walks you through Matt Pocock's skill flow step by step, from beginner to expert, plus guardrails for the mattpocock/skills repo.",
+  "types": "./types/index.d.ts"
+}
