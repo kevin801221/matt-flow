@@ -18,6 +18,29 @@ claude plugin install mattpocock-skills@claude-plugins-official --scope project
 
 也可以在 Claude Code 的提示列輸入 `/plugin install mattpocock-skills@claude-plugins-official`，再選範圍。
 
+`mattpocock-skills` 收錄在 Anthropic 官方的 marketplace（`anthropics/claude-plugins-official`）。安裝時如果出現找不到 marketplace 的錯誤，先加入這個 marketplace，再重新安裝：
+
+```bash
+claude plugin marketplace add anthropics/claude-plugins-official
+```
+
+安裝時會自動把檔案下載到 `~/.claude/plugins/cache/claude-plugins-official/mattpocock-skills/<版本>/`，啟用設定則寫進 settings：個人層級寫在 `~/.claude/settings.json`，專案層級寫在專案的 `.claude/settings.json`。**不要自己把檔案複製進 `cache` 資料夾**，沒有經過安裝登記的 plugin 不會被啟用。
+
+確認是否裝好：
+
+```bash
+claude plugin list
+```
+
+看到下面這樣就代表可以用了：
+
+```
+❯ mattpocock-skills@claude-plugins-official
+  Version: 1.3.1
+  Scope: user
+  Status: ✔ enabled
+```
+
 ## 安裝 matt-flow
 
 下面兩種方法擇一就好。兩種都裝的話，mod 會被載入兩次。
