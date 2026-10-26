@@ -135,6 +135,8 @@ const mark = (p: Progress, keys: StepKey[], state: StepState): Progress => ({
   steps: { ...p.steps, ...Object.fromEntries(keys.map(key => [key, state] as const)) },
 })
 const isBuilding = (p: Progress) => BUILD.some(key => p.steps[key])
+// A `git commit`, however git is pointed (`git -C dir commit`).
+const GIT_COMMIT = /\bgit(?:\s+-[cC]\s+\S+)*\s+commit\b/
 // What the rail guards: a project file that is not markdown, outside the tracker's folder and docs.
 // ponytail: `..` is not resolved; the gate keeps Claude on the flow, it is no sandbox (Bash gets past it anyway).
 const isCode = (cwd: string, path: string) =>
@@ -236,6 +238,8 @@ async function noteSkill($: EngineInterface, name: string, byPerson: boolean) {
   await update($, progress, p => (p.feature ? p : { ...p, feature: { name: null, since: now } }))
   const isLocal = await isLocalTracker($)
   await pass($, keys.filter(key => (BUILD.includes(key) ? byPerson : !(isLocal && ARTIFACTS.includes(key)))))
+  // One review per build: the fixes after it commit without another.
+  if (keys.includes('review')) await update($, progress, p => (isBuilding(p) ? { ...p, isReviewed: true } : p))
   await save($)
   await refreshStatus($)
 }
@@ -273,6 +277,17 @@ async function codeGate($: EngineInterface, path: string) {
   suggestion = STEPS[key].command
 
   return `matt-flow：還沒到動手做，程式碼鎖著。目前的步驟是「${STEPS[key].title}」，解鎖要由人輸入 ${suggestion}（已預填在輸入框）。停下來交棒：把這個指令告訴人，然後結束這一輪。不要改用 Bash 或其他方式寫這個檔案。`
+}
+
+// Why running `command` is denied, or undefined while it may go ahead: beginners
+// and intermediates commit what they build only after code-review has run.
+async function commitGate($: EngineInterface, command: string) {
+  const p = await read($, progress)
+  if (!GIT_COMMIT.test(command) || p.level === 'expert' || !isBuilding(p) || p.isReviewed || (await isQuiet($))) {
+    return undefined
+  }
+
+  return 'matt-flow：這次動手做還沒跑過 code-review，先不能 commit。先用 Skill 工具跑 code-review（或請人輸入 /code-review），跑過之後的 commit 都會放行。不要繞過這個阻擋。'
 }
 
 async function markDone($: EngineInterface, key: StepKey) {
@@ -400,6 +415,12 @@ export const register: Register = on => {
     if (ran.deny === undefined && !ran.isError) await noteWrite($, e.file_path.slice(`${repoRoot}/`.length))
 
     return ran
+  })
+
+  on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
+    const locked = await commitGate($, e.command)
+
+    return locked ? { deny: locked } : next(e)
   })
 
   on('tool.call', { tool: 'NotebookEdit' }, async ($, e, next) => {

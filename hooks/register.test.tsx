@@ -310,6 +310,51 @@ test('a project never set up locks nothing', async ($, on) => {
   expect((await edit($, 'src/app.ts')).deny).toBeUndefined()
 })
 
+const bash = ($: Parameters<TestBody>[0], command: string) => $.tool.call({ tool: 'Bash', command })
+
+test('a beginner building cannot commit until code-review runs, then every later commit goes', async ($, on) => {
+  engine(on)
+  await start($)
+  await typed($, 'grill-with-docs')
+  await typed($, 'implement')
+
+  expect((await bash($, 'git commit -m "wip"')).deny).toMatch(/code-review/)
+  expect((await bash($, `git -C ${REPO} commit -m "wip"`)).deny).toMatch(/code-review/)
+  await $.tool.call({ tool: 'Skill', skill: 'mattpocock-skills:code-review' })
+  expect((await bash($, 'git commit -m "feat"')).deny).toBeUndefined()
+  expect((await bash($, 'git commit -m "fix review"')).deny).toBeUndefined()
+})
+
+test('an intermediate building waits for code-review too, the person typing it counts', async ($, on) => {
+  engine(on, { files: GITHUB, stored: { level: 'intermediate' } })
+  await start($)
+  for (const skill of ['grill-with-docs', 'to-spec', 'to-tickets', 'implement']) await typed($, skill)
+
+  expect((await bash($, 'git commit -m "wip"')).deny).toMatch(/code-review/)
+  await typed($, 'code-review')
+  expect((await bash($, 'git commit -m "feat"')).deny).toBeUndefined()
+})
+
+test('commits outside building, and Bash that does not commit, always go', async ($, on) => {
+  engine(on)
+  await start($)
+  expect((await bash($, 'git commit -m "docs"')).deny).toBeUndefined()
+
+  await typed($, 'grill-with-docs')
+  await typed($, 'implement')
+  for (const command of ['git status', 'git log --grep commit', 'npm test']) {
+    expect((await bash($, command)).deny).toBeUndefined()
+  }
+})
+
+test('the expert commits freely: /implement-spec reviews its own work', async ($, on) => {
+  engine(on, { files: GITHUB, stored: { level: 'expert' } })
+  await start($)
+  for (const skill of ['grill-with-docs', 'to-spec', 'to-tickets', 'implement-spec']) await typed($, skill)
+
+  expect((await bash($, 'git commit -m "wip"')).deny).toBeUndefined()
+})
+
 test('an em-dash is denied inside the skills repo only', async ($, on) => {
   engine(on)
   await $.session.start({ cwd: REPO, surface: 'terminal', isInteractive: true })
