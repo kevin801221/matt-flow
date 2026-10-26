@@ -1,0 +1,5 @@
+{
+  "name": "matt-flow",
+  "owner": { "name": "kevin801221" },
+  "plugins": [{ "name": "matt-flow", "source": "./" }]
+}
