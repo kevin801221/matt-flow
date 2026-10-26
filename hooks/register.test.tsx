@@ -253,6 +253,63 @@ test('a project never set up stays quiet: skills there start nothing', async ($,
   expect(await seen($, /進行中/)).toBe('還沒有進行中的功能')
 })
 
+// Claude editing `path` under REPO, or outside it when absolute.
+const edit = ($: Parameters<TestBody>[0], path: string) =>
+  $.tool.call({ tool: 'Edit', file_path: path.startsWith('/') ? path : `${REPO}/${path}`, old_string: 'a', new_string: 'b' })
+
+test('with no feature under way, code is locked: the denial names /grill-with-docs, and offers it', async ($, on) => {
+  const { suggested } = engine(on)
+  await start($)
+
+  const denied = (await edit($, 'hooks/register.tsx')).deny
+  expect(denied).toMatch(/把想法問清楚/)
+  expect(denied).toMatch(/\/grill-with-docs/)
+  expect(denied).toMatch(/停下來交棒/)
+  expect(denied).toMatch(/Bash/)
+  expect((await $.tool.call({ tool: 'Write', file_path: `${REPO}/src/new.ts`, content: '' })).deny).toBeDefined()
+  expect(
+    (await $.tool.call({ tool: 'NotebookEdit', notebook_path: `${REPO}/play.ipynb`, new_source: '' })).deny,
+  ).toBeDefined()
+  await turnEnds($)
+  expect(suggested).toEqual(['/grill-with-docs'])
+})
+
+test('during a feature, the denial names the next step on the way to building', async ($, on) => {
+  engine(on, { files: GITHUB, stored: { level: 'intermediate' } })
+  await start($)
+  await typed($, 'grill-with-docs')
+  expect((await edit($, 'src/app.ts')).deny).toMatch(/\/to-spec/)
+
+  await typed($, 'to-spec')
+  expect((await edit($, 'src/app.ts')).deny).toMatch(/\/to-tickets/)
+})
+
+test('code unlocks once the person types /implement', async ($, on) => {
+  engine(on)
+  await start($)
+  await typed($, 'grill-with-docs')
+  expect((await edit($, 'src/app.ts')).deny).toMatch(/\/implement/)
+
+  await typed($, 'implement')
+  expect((await edit($, 'src/app.ts')).deny).toBeUndefined()
+})
+
+test('markdown, docs, the tracker folder and files outside the project are never locked', async ($, on) => {
+  engine(on)
+  await start($)
+
+  for (const path of ['GLOSSARY.md', 'docs/adr/0001.ts', '.scratch/rail/notes.txt', '/elsewhere/app.ts']) {
+    expect((await edit($, path)).deny).toBeUndefined()
+  }
+})
+
+test('a project never set up locks nothing', async ($, on) => {
+  engine(on, { files: {} })
+  await start($)
+
+  expect((await edit($, 'src/app.ts')).deny).toBeUndefined()
+})
+
 test('an em-dash is denied inside the skills repo only', async ($, on) => {
   engine(on)
   await $.session.start({ cwd: REPO, surface: 'terminal', isInteractive: true })

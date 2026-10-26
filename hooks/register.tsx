@@ -134,6 +134,13 @@ const mark = (p: Progress, keys: StepKey[], state: StepState): Progress => ({
   ...p,
   steps: { ...p.steps, ...Object.fromEntries(keys.map(key => [key, state] as const)) },
 })
+const isBuilding = (p: Progress) => BUILD.some(key => p.steps[key])
+// What the rail guards: a project file that is not markdown, outside the tracker's folder and docs.
+// ponytail: `..` is not resolved; the gate keeps Claude on the flow, it is no sandbox (Bash gets past it anyway).
+const isCode = (cwd: string, path: string) =>
+  path.startsWith(`${cwd}/`) &&
+  !/\.mdx?$/i.test(path) &&
+  ![`${SCRATCH}/`, 'docs/'].some(dir => path.startsWith(`${cwd}/${dir}`))
 // Ends the feature: it counts, and every step but setup starts over.
 const finish = (p: Progress): Progress => ({
   ...p,
@@ -255,6 +262,19 @@ async function checkArtifacts($: EngineInterface) {
   }
 }
 
+// Why editing `path` is denied, or undefined while it may go ahead. The unlock
+// command is offered to the person too.
+async function codeGate($: EngineInterface, path: string) {
+  const cwd = await read($, project)
+  const p = await read($, progress)
+  if (cwd === null || !isCode(cwd, path) || isBuilding(p) || (await isQuiet($))) return undefined
+  // Without a feature it is grilling; during one, the step it stands on.
+  const key = (p.feature && currentStep(p, true)) || 'grill'
+  suggestion = STEPS[key].command
+
+  return `matt-flow：還沒到動手做，程式碼鎖著。目前的步驟是「${STEPS[key].title}」，解鎖要由人輸入 ${suggestion}（已預填在輸入框）。停下來交棒：把這個指令告訴人，然後結束這一輪。不要改用 Bash 或其他方式寫這個檔案。`
+}
+
 async function markDone($: EngineInterface, key: StepKey) {
   await pass($, [key])
   await save($)
@@ -361,6 +381,8 @@ export const register: Register = on => {
   })
 
   on('tool.call', { tool: 'Edit' }, async ($, e, next) => {
+    const locked = await codeGate($, e.file_path)
+    if (locked) return { deny: locked }
     if (!inRepo(e.file_path)) return next(e)
     if (e.new_string.includes(EM_DASH)) return { deny: denial($.plugin.name) }
     const ran = await next(e)
@@ -370,12 +392,20 @@ export const register: Register = on => {
   })
 
   on('tool.call', { tool: 'Write' }, async ($, e, next) => {
+    const locked = await codeGate($, e.file_path)
+    if (locked) return { deny: locked }
     if (!inRepo(e.file_path)) return next(e)
     if (e.content.includes(EM_DASH)) return { deny: denial($.plugin.name) }
     const ran = await next(e)
     if (ran.deny === undefined && !ran.isError) await noteWrite($, e.file_path.slice(`${repoRoot}/`.length))
 
     return ran
+  })
+
+  on('tool.call', { tool: 'NotebookEdit' }, async ($, e, next) => {
+    const locked = await codeGate($, e.notebook_path)
+
+    return locked ? { deny: locked } : next(e)
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
