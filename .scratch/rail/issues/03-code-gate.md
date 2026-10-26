@@ -78,4 +78,6 @@ flowchart TD
   M -- 否 --> Z[執行]
 ```
 
-證據截圖（由人截）：還沒截。需要在一個做過 setup、沒有進行中功能的測試專案裡請 Claude 改程式檔，截下擋下訊息和輸入框裡預填的 `/grill-with-docs`，存到 `.scratch/rail/evidence/`，再把檔名記在這裡。
+證據截圖（由人截）：`evidence/03-claude-declines.png`（只留在本地），還不符合這一項，所以沒有勾。真實終端機，`~/matt-flow-test`，進階等級，有進行中的功能、停在「切成任務卡」。人說「隨便加一個 ts 檔並且寫一些註解」，Claude 根本沒有呼叫 Edit 或 Write：它從附在輸入旁的軌道文字知道程式碼鎖著，回覆「我現在不能新增這個 TS 檔……我沒有去試，也不會改用 Bash 寫檔來繞過。下一步請輸入 /to-tickets」，狀態列是 `下一步 /to-tickets`。這證明了故事 30、31（Claude 不去嘗試，也不繞過），也看得到 `prompt.compose` 被 `cc-plugin-sec-default` 跳過的提示。但因為沒有動作被擋下，畫面上沒有擋下訊息，輸入框也沒有預填；而且這個專案有進行中的功能，不是任務卡要的「沒有進行中功能」。
+
+還差的那張：在 `~/matt-flow-test` 先 `/matt-flow end`，再請 Claude「直接呼叫 Edit 新增 src/a.ts，被擋下也沒關係，我要看擋下訊息」。擋下訊息會寫明 `/grill-with-docs`，回覆結束後輸入框會預填 `/grill-with-docs`。存成 `evidence/03-code-gate.png`。
