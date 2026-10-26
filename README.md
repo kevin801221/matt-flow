@@ -94,14 +94,14 @@ matt-flow 是一條軌道：它記得每個專案走到流程的哪一步，把�
 ### 功能和通過
 
 - 跑了任何一個流程步驟的 skill（setup 除外），就開始一個**功能**。
-- 有產出物的步驟看產出物。用本地 markdown tracker 時，「寫成規格書」要等 `.scratch/<功能>/spec.md` 寫出來，「切成任務卡」要等 `.scratch/<功能>/issues/` 裡至少有一張卡，只輸入 `/to-spec` 不算；產出物在每一輪結束時檢查，規格寫出來後，功能就用它的資料夾名稱稱呼。用 GitHub 或 GitLab tracker 時，skill 跑過就算。
+- 有產出物的步驟看產出物。用本地 markdown tracker 時，「寫成規格書」要等 `.scratch/<功能>/spec.md` 寫出來，「切成任務卡」要等同一個資料夾的 `issues/` 裡至少有一張卡，只輸入 `/to-spec` 不算；產出物在 Claude 每次回覆完時檢查，規格寫出來後，功能就用它的資料夾名稱稱呼。用 GitHub 或 GitLab tracker 時，skill 跑過就算。
 - 「動手做」只在**你**輸入 `/implement`（高手是 `/implement-spec`）時通過。Claude 自己跑 `tdd` 不算，所以它沒辦法自己越過交棒。
 - 其他步驟（問清楚、檢查、開 PR、複盤）skill 跑過就算，你輸入的或 Claude 透過 Skill 工具跑的都可以。
 - 「複盤」通過，功能就結束：已完成的功能數加一，下一個功能從 `/grill-with-docs` 重新開始。
 
 ### 交棒
 
-步驟通過時會跳出提示，這一輪結束時，下一步的指令會預填在輸入框，按 Enter 就啟動。Claude 的系統提示最後也有一段，寫著目前的功能、等級、步驟、哪些動作會被擋、怎麼解鎖，以及交棒的規矩：做完就停下來把下一步的指令告訴你，不建議其他流程指令，絕不繞過阻擋。
+步驟通過時會跳出提示，Claude 這次回覆完時，下一步的指令會預填在輸入框，按 Enter 就啟動。Claude 的系統提示最後也有一段，寫著目前的功能、等級、步驟、哪些動作會被擋、怎麼解鎖，以及交棒的規矩：做完就停下來把下一步的指令告訴你，不建議其他流程指令，絕不繞過阻擋。如果組織的安全 hook 不讓 mod 改系統提示，同一段會改附在你每次的輸入旁邊。
 
 ### 程式碼關卡
 
@@ -113,7 +113,7 @@ markdown 檔、`docs/`、`.scratch/` 和專案外的檔案不算程式碼，所�
 
 ### commit 關卡
 
-新手和進階：動手做開始後，要先跑過一次 code-review（你輸入 `/code-review`，或 Claude 透過 Skill 工具執行，例如 `/implement` 自己跑的那次），Claude 的 `git commit` 才會放行；review 之後的修正不用再 review 一次。動手做以外的 commit 一律放行，那時候 Claude 改得到的只有文件。高手不擋，`/implement-spec` 最後一步自己會 review。
+新手和進階：每次你輸入 `/implement` 之後，要先跑過一次 code-review（你輸入 `/code-review`，或 Claude 透過 Skill 工具執行，例如 `/implement` 自己跑的那次），Claude 的 `git commit` 才會放行；review 之後的修正不用再 review 一次。被擋下時，`/code-review` 會預填在輸入框。動手做以外的 commit 一律放行，那時候 Claude 改得到的只有文件。高手不擋，`/implement-spec` 最後一步自己會 review。
 
 ### 跳過、結束、關掉
 

@@ -4,6 +4,8 @@ import type { FsEntry, UiPane } from 'claude-code'
 
 const REPO = '/repo'
 
+type Engine = Parameters<TestBody>[0]
+
 const PANE = {
   plugin: 'matt-flow',
   component: 'Pane',
@@ -93,19 +95,19 @@ const engine = (on: Parameters<TestBody>[1], { files = SKILLS_REPO, stored }: Wo
   on('turn.complete', () => ({ text: '' }))
   on('prompt.compose', () => ({ sections: [{ id: 'intro', text: 'You are Claude Code.', scope: 'shared' }] }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
-  on('prompt.submit', (_, e) => ({ text: e.text }))
+  on('prompt.submit', (_, e) => ({ text: e.text, context: e.context }))
   on('tool.call', () => ({ result: {} }))
 
   return { filled, suggested, toasts, write: (path: string, text = '') => void disk.set(path, { text, mtimeMs: 2 }) }
 }
 
-const start = ($: Parameters<TestBody>[0]) => $.session.start({ cwd: REPO, surface: 'terminal', isInteractive: true })
+const start = ($: Engine) => $.session.start({ cwd: REPO, surface: 'terminal', isInteractive: true })
 
-const turnEnds = ($: Parameters<TestBody>[0]) =>
+const turnEnds = ($: Engine) =>
   $.turn.complete({ answer: '', durationMs: 0, isAborted: false, turnId: 't', reason: 'answer' })
 
 // The text of the pane's first Text matching `pattern`, on the terminal.
-const seen = async ($: Parameters<TestBody>[0], pattern: RegExp) => {
+const seen = async ($: Engine, pattern: RegExp) => {
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   const found = await ui.find({ type: 'Text', text: pattern })
   await ui.unmount()
@@ -114,7 +116,7 @@ const seen = async ($: Parameters<TestBody>[0], pattern: RegExp) => {
 }
 
 // The person typing `/name`, as the engine raises it.
-const typed = ($: Parameters<TestBody>[0], name: string) =>
+const typed = ($: Engine, name: string) =>
   $.prompt.submit({ text: `/${name}`, command: { name, args: '' }, wait: false, origin: { kind: 'composer' } })
 
 test('a set-up project starts the beginner at grilling, on every surface', async ($, on) => {
@@ -140,6 +142,15 @@ test('progress saved by 0.2 carries over: its steps passed, its rounds finished 
   await ui.unmount()
 })
 
+test('progress 0.2 left on a finished round loads as a finished feature, not a stuck one', async ($, on) => {
+  engine(on, { stored: { level: 'beginner', done: ['setup', 'grill', 'build', 'review', 'retro'], rounds: 1 } })
+  await start($)
+
+  expect(await seen($, /已完成/)).toMatch(/已完成 2 個功能/)
+  expect(await seen($, /進行中/)).toBe('還沒有進行中的功能')
+  expect(await seen($, /▶/)).toBe('▶ 2. 把想法問清楚')
+})
+
 test('a skill the person types moves the guide on', async ($, on) => {
   engine(on)
   await start($)
@@ -148,7 +159,7 @@ test('a skill the person types moves the guide on', async ($, on) => {
   expect(await seen($, /▶/)).toBe('▶ 3. 動手做')
 })
 
-test('the pane is a dashboard on every surface: the card offers skip and stuck, nothing that runs or ticks a step', async ($, on) => {
+test('the pane is a dashboard on every surface: the card offers skip and stuck, nothing that runs or passes a step', async ($, on) => {
   engine(on)
   await start($)
   await turnEnds($)
@@ -200,7 +211,7 @@ test('a skill the model runs through the Skill tool moves the guide on too', asy
   await ui.unmount()
 })
 
-test('the expert track builds in parallel', async ($, on) => {
+test('the expert level builds in parallel', async ($, on) => {
   engine(on)
   await $.session.start({ cwd: REPO, surface: 'terminal', isInteractive: true })
 
@@ -273,6 +284,30 @@ test('on the local tracker, spec and tickets pass on their files, written since 
   expect(await seen($, /▶/)).toBe('▶ 5. 動手做')
 })
 
+test('an old feature\'s ticket touched before this feature has a spec does not pass its tickets', async ($, on) => {
+  const { write } = engine(on, { files: { ...SKILLS_REPO, '.scratch/old/issues/01-a.md': '' }, stored: { level: 'intermediate' } })
+  await start($)
+  await typed($, 'grill-with-docs')
+  write('.scratch/old/issues/01-a.md', 'Status: done')
+  await turnEnds($)
+  expect(await seen($, /切成任務卡/)).toBe('○ 4. 切成任務卡')
+
+  write('.scratch/rail/spec.md')
+  await turnEnds($)
+  expect(await seen($, /▶/)).toBe('▶ 4. 切成任務卡')
+})
+
+test('a step outside the level passes quietly: no toast, nothing offered', async ($, on) => {
+  const { suggested, toasts } = engine(on, { files: GITHUB })
+  await start($)
+  await typed($, 'grill-with-docs')
+  await typed($, 'to-spec')
+  await turnEnds($)
+
+  expect(toasts).toEqual(['✔ 把想法問清楚 通過 → 下一步 /implement'])
+  expect(suggested).toEqual(['/implement'])
+})
+
 test('on the GitHub tracker, spec and tickets pass when their skills run', async ($, on) => {
   engine(on, { files: GITHUB, stored: { level: 'intermediate' } })
   await start($)
@@ -304,7 +339,7 @@ test('a project never set up stays quiet: skills there start nothing', async ($,
 })
 
 // Claude editing `path` under REPO, or outside it when absolute.
-const edit = ($: Parameters<TestBody>[0], path: string) =>
+const edit = ($: Engine, path: string) =>
   $.tool.call({ tool: 'Edit', file_path: path.startsWith('/') ? path : `${REPO}/${path}`, old_string: 'a', new_string: 'b' })
 
 test('with no feature under way, code is locked: the denial names /grill-with-docs, and offers it', async ($, on) => {
@@ -360,7 +395,7 @@ test('a project never set up locks nothing', async ($, on) => {
   expect((await edit($, 'src/app.ts')).deny).toBeUndefined()
 })
 
-const bash = ($: Parameters<TestBody>[0], command: string) => $.tool.call({ tool: 'Bash', command })
+const bash = ($: Engine, command: string) => $.tool.call({ tool: 'Bash', command })
 
 test('a beginner building cannot commit until code-review runs, then every later commit goes', async ($, on) => {
   engine(on)
@@ -385,6 +420,23 @@ test('an intermediate building waits for code-review too, the person typing it c
   expect((await bash($, 'git commit -m "feat"')).deny).toBeUndefined()
 })
 
+test('a denied commit offers /code-review, and each /implement the person types wants its own review', async ($, on) => {
+  const { suggested } = engine(on)
+  await start($)
+  await typed($, 'grill-with-docs')
+  await typed($, 'implement')
+  await turnEnds($)
+
+  const offered = suggested.length
+  expect((await bash($, 'git commit -m "wip"')).deny).toBeDefined()
+  await turnEnds($)
+  expect(suggested.slice(offered)).toEqual(['/code-review'])
+  await typed($, 'code-review')
+  expect((await bash($, 'git commit -m "first"')).deny).toBeUndefined()
+  await typed($, 'implement')
+  expect((await bash($, 'git commit -m "second"')).deny).toMatch(/code-review/)
+})
+
 test('commits outside building, and Bash that does not commit, always go', async ($, on) => {
   engine(on)
   await start($)
@@ -406,7 +458,7 @@ test('the expert commits freely: /implement-spec reviews its own work', async ($
 })
 
 // The rail's section of the system prompt, checked to come last, or undefined.
-const railSection = async ($: Parameters<TestBody>[0]) => {
+const railSection = async ($: Engine) => {
   const { sections } = await $.prompt.compose({
     model: 'claude-opus-5-5',
     promptModel: 'claude-opus-5-5',
@@ -429,7 +481,7 @@ test('with no feature, the system prompt says code is locked behind /grill-with-
   expect(text).toMatch(/還沒有進行中的功能/)
   expect(text).toMatch(/新手/)
   expect(text).toMatch(/目前的步驟：把想法問清楚（\/grill-with-docs）/)
-  expect(text).toMatch(/改程式碼.*\/grill-with-docs/)
+  expect(text).toMatch(/改程式碼（Edit.*\/grill-with-docs/)
   expect(text).not.toMatch(/git commit/)
   expect(text).toMatch(/停下來/)
   expect(text).toMatch(/不要建議其他流程指令/)
@@ -448,7 +500,7 @@ test('once the spec is written, the system prompt names the feature and points a
   expect(text).toMatch(/「rail」/)
   expect(text).toMatch(/進階/)
   expect(text).toMatch(/目前的步驟：切成任務卡（\/to-tickets）/)
-  expect(text).toMatch(/改程式碼.*\/to-tickets/)
+  expect(text).toMatch(/改程式碼（Edit.*\/to-tickets/)
 })
 
 test('while building, the system prompt locks only the commit, until code-review runs', async ($, on) => {
@@ -458,10 +510,30 @@ test('while building, the system prompt locks only the commit, until code-review
   await typed($, 'implement')
 
   const text = await railSection($)
-  expect(text).not.toMatch(/改程式碼/)
+  expect(text).not.toMatch(/改程式碼（Edit/)
   expect(text).toMatch(/git commit.*code-review/)
   await typed($, 'code-review')
   expect(await railSection($)).toMatch(/現在會被擋的動作：沒有/)
+})
+
+// A prompt the person types; resolves the context the model reads beside it.
+const said = async ($: Engine, text: string) =>
+  (await $.prompt.submit({ text, wait: false, origin: { kind: 'composer' } })).context ?? []
+
+test('until the system prompt reaches the rail, the rail rides along with each prompt', async ($, on) => {
+  engine(on)
+  await start($)
+
+  expect((await said($, 'hi')).join()).toMatch(/# matt-flow 軌道[^]*目前的步驟：把想法問清楚/)
+  await railSection($)
+  expect(await said($, 'hi again')).toEqual([])
+})
+
+test('a project never set up gets no rail beside its prompts either', async ($, on) => {
+  engine(on, { files: {} })
+  await start($)
+
+  expect(await said($, 'hi')).toEqual([])
 })
 
 test('a project never set up gets no rail in its system prompt', async ($, on) => {
@@ -472,7 +544,7 @@ test('a project never set up gets no rail in its system prompt', async ($, on) =
 })
 
 // The person typing `/matt-flow args`; resolves the line it answers.
-const flow = async ($: Parameters<TestBody>[0], args = '') =>
+const flow = async ($: Engine, args = '') =>
   (
     await $.command.run({
       command: 'matt-flow',

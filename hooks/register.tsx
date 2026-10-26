@@ -23,7 +23,7 @@ const STEPS = {
     // Passes on SETUP_FILE alone.
     skills: [] as string[],
     what: '告訴 AI 任務放哪裡（GitHub 或本地檔案）、文件放哪裡。每個專案只要做一次。',
-    tip: '做過就會自動打勾，之後每個新功能都從下一步開始。',
+    tip: '做過就會自動通過，之後每個新功能都從下一步開始。',
   },
   grill: {
     title: '把想法問清楚',
@@ -126,6 +126,9 @@ const unsynced = atom({ plugin: 'matt-flow', key: 'unsynced' } as const, [])
 
 // The next step's command, offered in the prompt box once the turn ends.
 let suggestion: string | undefined
+// Whether prompt.compose reaches this module. A managed hook may send it past
+// user plugins, as it does skill.prompt; until it arrives, the rail rides along with each prompt.
+let isComposed = false
 
 const stateOf = (p: Progress, key: StepKey, setUp: boolean): StepState | undefined =>
   key === 'setup' && setUp ? 'passed' : p.steps[key]
@@ -147,7 +150,7 @@ const featureLine = ({ feature }: Progress) =>
 // ponytail: `..` is not resolved; the gate keeps Claude on the flow, it is no sandbox (Bash gets past it anyway).
 const isCode = (cwd: string, path: string) =>
   path.startsWith(`${cwd}/`) &&
-  !/\.mdx?$/i.test(path) &&
+  !/\.md$/i.test(path) &&
   ![`${SCRATCH}/`, 'docs/'].some(dir => path.startsWith(`${cwd}/${dir}`))
 // Ends the feature: it counts, and every step but setup starts over.
 const finish = (p: Progress): Progress => ({
@@ -171,10 +174,14 @@ type Saved = Partial<Progress> & { done?: string[]; rounds?: number }
 function restore(saved: Saved | undefined, now: number): Progress {
   const level = saved?.level && ORDER.includes(saved.level) ? saved.level : FRESH.level
   if (saved?.steps) return { ...FRESH, ...saved, level }
-  const steps = Object.fromEntries((saved?.done ?? []).map(key => [key, 'passed'] as const))
+  const done = saved?.done ?? []
+  const features = saved?.rounds ?? 0
+  // A round 0.2 had finished but not moved past is a finished feature.
+  if (done.includes('retro')) return { ...FRESH, level, features: features + 1 }
+  const steps = Object.fromEntries(done.map(key => [key, 'passed'] as const))
   const isUnderWay = Object.keys(steps).some(key => key !== 'setup')
 
-  return { ...FRESH, level, steps, feature: isUnderWay ? { name: null, since: now } : null, features: saved?.rounds ?? 0 }
+  return { ...FRESH, level, steps, feature: isUnderWay ? { name: null, since: now } : null, features }
 }
 
 async function checkSetup($: EngineInterface) {
@@ -228,21 +235,27 @@ async function endFeature($: EngineInterface) {
 }
 
 // Passes the steps not passed yet (a skipped one too, once it is done after all)
-// and hands over to the next one; `note` leads the toast. Passing the retro ends the feature.
+// and hands over to the next one; `note` leads the toast. A step outside the
+// level passes quietly. Passing the retro ends the feature.
 async function pass($: EngineInterface, keys: StepKey[], note?: string) {
   const before = await read($, progress)
   const fresh = keys.filter(key => before.steps[key] !== 'passed')
-  if (fresh.length === 0) {
+  if (fresh.length > 0) await update($, progress, p => mark(p, fresh, 'passed'))
+  const own = fresh.filter(key => LEVELS[before.level].steps.includes(key))
+  if (own.length === 0) {
     if (note) $.ui.toast(note)
     return
   }
-  await update($, progress, p => mark(p, fresh, 'passed'))
-  const said = fresh.includes('retro')
+  const said = own.includes('retro')
     ? await endFeature($)
-    : `✔ ${STEPS[fresh[0]!].title} 通過 → 下一步 ${await nextCommand($)}`
-  // The hand-over: the next step's command, offered in the prompt box once the turn ends.
+    : `✔ ${STEPS[own[0]!].title} 通過 → 下一步 ${await nextCommand($)}`
   suggestion = await nextCommand($)
   $.ui.toast(note ? `${note} · ${said}` : said)
+}
+
+async function startFeature($: EngineInterface) {
+  const now = await $.clock.now()
+  await update($, progress, p => (p.feature ? p : { ...p, feature: { name: null, since: now } }))
 }
 
 // A skill ran: typed by the person, or run by the model through the Skill tool.
@@ -251,8 +264,7 @@ async function noteSkill($: EngineInterface, name: string, byPerson: boolean) {
   const skill = name.split(':').pop() ?? name
   const keys = (Object.keys(STEPS) as StepKey[]).filter(key => STEPS[key].skills.includes(skill))
   if (keys.length === 0 || (await isQuiet($))) return
-  const now = await $.clock.now()
-  await update($, progress, p => (p.feature ? p : { ...p, feature: { name: null, since: now } }))
+  await startFeature($)
   // The person typing a later step's command skips the steps before it they have not passed.
   const p = await read($, progress)
   const order = LEVELS[p.level].steps
@@ -265,14 +277,17 @@ async function noteSkill($: EngineInterface, name: string, byPerson: boolean) {
     keys.filter(key => (BUILD.includes(key) ? byPerson : !(isLocal && ARTIFACTS.includes(key)))),
     skipped.length > 0 ? `↷ 跳過${skipped.map(key => `「${STEPS[key].title}」`).join('')}` : undefined,
   )
-  // One review per build: the fixes after it commit without another.
+  // One review per build, and each /implement the person types is a build; the fixes after a review commit without another.
+  if (byPerson && keys.some(key => BUILD.includes(key))) await update($, progress, p => ({ ...p, isReviewed: false }))
   if (keys.includes('review')) await update($, progress, p => (isBuilding(p) ? { ...p, isReviewed: true } : p))
   await save($)
   await refreshStatus($)
 }
 
 // With the local tracker, spec and tickets pass on files written since the
-// feature started: in its own folder once it has a spec, else in any.
+// feature started. Until a spec names the feature's folder only a spec counts, in any folder;
+// then both count, in that folder alone.
+// ponytail: written means modified (fs has no creation time), so an old spec or ticket of the same folder edited now counts.
 async function checkArtifacts($: EngineInterface) {
   const p = await read($, progress)
   if (p.feature === null || (await isQuiet($)) || !(await isLocalTracker($))) return
@@ -284,7 +299,7 @@ async function checkArtifacts($: EngineInterface) {
   for (const folder of folders) {
     const found: StepKey[] = []
     if (isNew(await list($, `${root}/${folder}`), /^spec\.md$/)) found.push('spec')
-    if (isNew(await list($, `${root}/${folder}/issues`), /\.md$/)) found.push('tickets')
+    if (name !== null && isNew(await list($, `${root}/${folder}/issues`), /\.md$/)) found.push('tickets')
     if (found.length === 0) continue
     // The feature goes by its spec's folder.
     if (name === null && found.includes('spec')) await update($, progress, q => ({ ...q, feature: { name: folder, since } }))
@@ -302,12 +317,13 @@ async function codeGate($: EngineInterface, path: string) {
   const key = unlockStep(p)
   suggestion = STEPS[key].command
 
-  return `matt-flow：還沒到動手做，程式碼鎖著。目前的步驟是「${STEPS[key].title}」，解鎖要由人輸入 ${suggestion}（已預填在輸入框）。停下來交棒：把這個指令告訴人，然後結束這一輪。不要改用 Bash 或其他方式寫這個檔案。`
+  return `matt-flow：還沒到動手做，程式碼鎖著。目前的步驟是「${STEPS[key].title}」，解鎖要由人輸入 ${suggestion}（已預填在輸入框）。停下來交棒：把這個指令告訴人，然後結束這次回覆。不要改用 Bash 或其他方式寫這個檔案。`
 }
 
 // Why running `command` is denied, or undefined while it may go ahead.
 async function commitGate($: EngineInterface, command: string) {
   if (!GIT_COMMIT.test(command) || !isCommitLocked(await read($, progress)) || (await isQuiet($))) return undefined
+  suggestion = STEPS.review.command
 
   return 'matt-flow：這次動手做還沒跑過 code-review，先不能 commit。先用 Skill 工具跑 code-review（或請人輸入 /code-review），跑過之後的 commit 都會放行。不要繞過這個阻擋。'
 }
@@ -334,7 +350,7 @@ async function railPrompt($: EngineInterface) {
     ...locks.map(lock => `  - ${lock}`),
     '',
     '規矩：',
-    `- 交棒：做完人這次啟動的工作，或動作被擋下時，就停下來，把下一步的指令（現在是 ${step.command}）告訴人，然後結束這一輪；由人輸入，不要自己往下做。`,
+    `- 交棒：做完人這次啟動的工作，或改程式碼被擋下時，就停下來，把下一步的指令（現在是 ${step.command}）告訴人，然後結束這次回覆；由人輸入，不要自己往下做。`,
     '- 除了下一步的指令，不要建議其他流程指令。',
     '- 絕不繞過任何阻擋，包括改用 Bash 寫檔或 commit。',
   ].join('\n')
@@ -344,9 +360,9 @@ async function railPrompt($: EngineInterface) {
 async function skipStep($: EngineInterface) {
   const quiet = await quietLine($)
   if (quiet) return quiet
-  const now = await $.clock.now()
   const key = currentStep(await read($, progress), true) ?? 'grill'
-  await update($, progress, p => ({ ...mark(p, [key], 'skipped'), feature: p.feature ?? { name: null, since: now } }))
+  await startFeature($)
+  await update($, progress, p => mark(p, [key], 'skipped'))
   const line = key === 'retro' ? await endFeature($) : `↷ 跳過「${STEPS[key].title}」→ 下一步 ${await nextCommand($)}`
   await save($)
   await refreshStatus($)
@@ -456,8 +472,9 @@ export const register: Register = on => {
   // A skill the person typed as `/name`.
   on('prompt.submit', async ($, e, next) => {
     if (e.command) await noteSkill($, e.command.name, true)
+    const rail = isComposed ? undefined : await railPrompt($)
 
-    return next(e)
+    return next(rail === undefined ? e : { ...e, context: [...(e.context ?? []), rail] })
   })
 
   // A skill the model ran through the Skill tool.
@@ -473,10 +490,7 @@ export const register: Register = on => {
     await update($, tokens, () => context.tokens ?? null)
     const wasSetUp = await read($, isSetUp)
     await checkSetup($)
-    if (!wasSetUp && !(await isQuiet($))) {
-      suggestion = await nextCommand($)
-      $.ui.toast(`✔ ${STEPS.setup.title} 通過 → 下一步 ${suggestion}`)
-    }
+    if (!wasSetUp && !(await isQuiet($))) await pass($, ['setup'])
     await checkArtifacts($)
     await save($)
     await refreshStatus($)
@@ -512,6 +526,7 @@ export const register: Register = on => {
   })
 
   on('prompt.compose', async ($, e, next) => {
+    isComposed = true
     const composed = await next(e)
     const text = await railPrompt($)
 
@@ -641,7 +656,7 @@ export const register: Register = on => {
             </Box>
             {zone >= 0.8 && (
               <Text color="warning" wrap="wrap">
-                對話快塞滿了：在這一步做完時 /compact
+                對話快塞滿了：交棒時先 /compact
               </Text>
             )}
           </Box>

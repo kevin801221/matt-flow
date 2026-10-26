@@ -62,3 +62,7 @@ flowchart TD
   E -- 是 --> OK
   E -- 否 --> X[擋下：訊息指名 code-review]
 ```
+
+## Comments
+
+- 2026-10-26（code-review 後）：「每次動手做只要求跑一次 code-review」解讀成每次人輸入 `/implement`（或 `/implement-spec`）都算一次動手做，所以進階等級一張卡一次 `/implement` 時，每張卡都要 review 一次。被擋下時 `/code-review` 會預填給人。

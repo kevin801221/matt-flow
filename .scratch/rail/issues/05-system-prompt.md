@@ -100,3 +100,7 @@
 - 除了下一步的指令，不要建議其他流程指令。
 - 絕不繞過任何阻擋，包括改用 Bash 寫檔或 commit。
 ```
+
+## Comments
+
+- 2026-10-26（實作後）：0.3.0 在這個 session 重新載入後，引擎回報 `matt-flow: its prompt.compose hook was skipped. "cc-plugin-sec-default" runs first and sent the event on past it.`。跟 `skill.prompt` 一樣，組織的安全 hook 在 `prompt.compose` 上跳過使用者層級的 plugin，所以這段系統提示在這個環境到不了 Claude。補了一條備援：模組還沒被 `prompt.compose` 呼叫到之前，同一段文字以 `prompt.submit` 的 `context` 附在人每次的輸入旁邊；`prompt.compose` 一旦呼叫到，就只走系統提示。`prompt.submit` 在這個環境有沒有也被跳過，要在真實 session 裡輸入一句話確認（看有沒有同樣的提示）。
