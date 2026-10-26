@@ -15,7 +15,7 @@
 - [x] 沒做過 setup 的專案完全不擋
 - [x] Matt skills repo 裡的 em dash 防護照舊
 - [x] 證據：完成時在本檔底下加「## 證據」，貼上新增測試先失敗、後通過的輸出，以及一張 mermaid 流程圖（一個 Edit 從進來到放行或擋下）
-- [ ] 證據截圖（由人截）：在一個做過 setup、沒有進行中功能的測試專案裡，請 Claude 改一個程式檔。截圖要看得到擋下訊息（含解鎖指令），以及輸入框裡預填的指令。截圖存放在本功能的 evidence 資料夾（只留在本地），本檔記錄檔名和截到的內容
+- [x] 證據截圖（由人截）：在一個做過 setup、沒有進行中功能的測試專案裡，請 Claude 改一個程式檔。截圖要看得到擋下訊息（含解鎖指令），以及輸入框裡預填的指令。截圖存放在本功能的 evidence 資料夾（只留在本地），本檔記錄檔名和截到的內容
 
 ## 證據
 
@@ -78,6 +78,8 @@ flowchart TD
   M -- 否 --> Z[執行]
 ```
 
-證據截圖（由人截）：`evidence/03-claude-declines.png`（只留在本地），還不符合這一項，所以沒有勾。真實終端機，`~/matt-flow-test`，進階等級，有進行中的功能、停在「切成任務卡」。人說「隨便加一個 ts 檔並且寫一些註解」，Claude 根本沒有呼叫 Edit 或 Write：它從附在輸入旁的軌道文字知道程式碼鎖著，回覆「我現在不能新增這個 TS 檔……我沒有去試，也不會改用 Bash 寫檔來繞過。下一步請輸入 /to-tickets」，狀態列是 `下一步 /to-tickets`。這證明了故事 30、31（Claude 不去嘗試，也不繞過），也看得到 `prompt.compose` 被 `cc-plugin-sec-default` 跳過的提示。但因為沒有動作被擋下，畫面上沒有擋下訊息，輸入框也沒有預填；而且這個專案有進行中的功能，不是任務卡要的「沒有進行中功能」。
+證據截圖（由人截），兩張，都只留在本地。
 
-還差的那張：在 `~/matt-flow-test` 先 `/matt-flow end`，再請 Claude「直接呼叫 Edit 新增 src/a.ts，被擋下也沒關係，我要看擋下訊息」。擋下訊息會寫明 `/grill-with-docs`，回覆結束後輸入框會預填 `/grill-with-docs`。存成 `evidence/03-code-gate.png`。
+`evidence/03-code-gate.png`，符合這一項：`~/matt-flow-test`，進階等級。先 `/matt-flow end`（回覆 `🎉 功能結束，已完成 1 個功能 → 下一個從 /grill-with-docs 開始`），面板變成「還沒有進行中的功能」、`已完成 1 個功能`、目前步驟「把想法問清楚」。人說「直接呼叫 Edit 新增 src/a.ts，被擋下也沒關係」，`Create(src/a.ts)` 被擋下，錯誤訊息是完整的擋下訊息：「matt-flow：還沒到動手做，程式碼鎖著。目前的步驟是「把想法問清楚」，解鎖要由人輸入 /grill-with-docs（已預填在輸入框）。停下來交棒……不要改用 Bash 或其他方式寫這個檔案。」Claude 回覆 src/a.ts 沒有建立、不會改用 Bash，請人輸入 /grill-with-docs，然後結束回覆；輸入框裡預填著 `/grill-with-docs`，狀態列是 `下一步 /grill-with-docs`。
+
+`evidence/03-claude-declines.png`，先拍的那張：真實終端機，`~/matt-flow-test`，進階等級，有進行中的功能、停在「切成任務卡」。人說「隨便加一個 ts 檔並且寫一些註解」，Claude 根本沒有呼叫 Edit 或 Write：它從附在輸入旁的軌道文字知道程式碼鎖著，回覆「我現在不能新增這個 TS 檔……我沒有去試，也不會改用 Bash 寫檔來繞過。下一步請輸入 /to-tickets」，狀態列是 `下一步 /to-tickets`。這證明了故事 30、31（Claude 不去嘗試，也不繞過），也看得到 `prompt.compose` 被 `cc-plugin-sec-default` 跳過的提示。因為沒有動作被擋下，這張沒有擋下訊息和預填，所以補拍了上面那張。
