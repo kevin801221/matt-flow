@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Level } from '../types'
+import type { Level, Progress, StepState } from '../types'
 
 const PANE = 'matt-flow'
 const TITLE = '✦ Matt 導航'
@@ -109,40 +109,52 @@ const ORDER: Level[] = ['beginner', 'intermediate', 'expert']
 const SYNC_TARGET = /^(README\.md|\.claude-plugin\/plugin\.json|docs\/|skills\/engineering\/ask-matt\/)/
 const PROMOTED = /^skills\/(?:engineering|productivity)\/([^/]+)\//
 
+const FRESH: Progress = { level: 'beginner', steps: {}, feature: null, isReviewed: false, isOff: false, features: 0 }
+
 const project = atom({ plugin: 'matt-flow', key: 'project' } as const, null)
-const level = atom({ plugin: 'matt-flow', key: 'level' } as const, 'beginner')
-const done = atom({ plugin: 'matt-flow', key: 'done' } as const, [])
-const rounds = atom({ plugin: 'matt-flow', key: 'rounds' } as const, 0)
+const progress = atom({ plugin: 'matt-flow', key: 'progress' } as const, FRESH)
 const isSetUp = atom({ plugin: 'matt-flow', key: 'isSetUp' } as const, false)
 const tokens = atom({ plugin: 'matt-flow', key: 'tokens' } as const, null)
 const unsynced = atom({ plugin: 'matt-flow', key: 'unsynced' } as const, [])
 
-const isStepDone = (list: string[], key: StepKey, setUp: boolean) =>
-  list.includes(key) || (key === 'setup' && setUp)
-const currentStep = (lv: Level, list: string[], setUp: boolean) =>
-  LEVELS[lv].steps.find(key => !isStepDone(list, key, setUp))
+const stateOf = (p: Progress, key: StepKey, setUp: boolean): StepState | undefined =>
+  key === 'setup' && setUp ? 'passed' : p.steps[key]
+const currentStep = (p: Progress, setUp: boolean) => LEVELS[p.level].steps.find(key => !stateOf(p, key, setUp))
+const mark = (p: Progress, keys: StepKey[], state: StepState): Progress => ({
+  ...p,
+  steps: { ...p.steps, ...Object.fromEntries(keys.map(key => [key, state] as const)) },
+})
 const bar = (part: number, width: number) => Math.max(0, Math.min(width, Math.round(part * width)))
 
 async function save($: EngineInterface) {
   const key = await read($, project)
   if (key === null) return
-  await $.store.set(`progress:${key}`, {
-    level: await read($, level),
-    done: await read($, done),
-    rounds: await read($, rounds),
-  })
+  await $.store.set(`progress:${key}`, await read($, progress))
+}
+
+type Saved = Partial<Progress> & { done?: string[]; rounds?: number }
+
+// 0.2 stored the passed steps as `done` and the finished features as `rounds`.
+function restore(saved: Saved | undefined, now: number): Progress {
+  const level = saved?.level && ORDER.includes(saved.level) ? saved.level : FRESH.level
+  if (saved?.steps) return { ...FRESH, ...saved, level }
+  const steps = Object.fromEntries((saved?.done ?? []).map(key => [key, 'passed'] as const))
+  const isUnderWay = Object.keys(steps).some(key => key !== 'setup')
+
+  return { ...FRESH, level, steps, feature: isUnderWay ? { name: null, since: now } : null, features: saved?.rounds ?? 0 }
+}
+
+async function checkSetup($: EngineInterface) {
+  const hasSetup = await $.fs.exists(`${await read($, project)}/${SETUP_FILE}`)
+  await update($, isSetUp, () => hasSetup)
 }
 
 async function load($: EngineInterface, cwd: string) {
   await update($, project, () => cwd)
-  const hasSetup = await $.fs.exists(SETUP_FILE)
-  await update($, isSetUp, () => hasSetup)
-  const saved = (await $.store.get(`progress:${cwd}`)) as
-    | { level?: Level; done?: string[]; rounds?: number }
-    | undefined
-  if (saved?.level && ORDER.includes(saved.level)) await update($, level, () => saved.level!)
-  if (Array.isArray(saved?.done)) await update($, done, () => saved.done!)
-  if (typeof saved?.rounds === 'number') await update($, rounds, () => saved.rounds!)
+  await checkSetup($)
+  const saved = (await $.store.get(`progress:${cwd}`)) as Saved | undefined
+  const now = await $.clock.now()
+  await update($, progress, () => restore(saved, now))
 }
 
 async function refreshStatus($: EngineInterface) {
@@ -150,55 +162,62 @@ async function refreshStatus($: EngineInterface) {
   if (pending.length > 0) {
     return $.ui.status(`${pending.join(', ')} 改了 → 同步 README · plugin.json · docs · ask-matt`)
   }
-  const list = await read($, done)
+  const p = await read($, progress)
   const setUp = await read($, isSetUp)
   // Quiet in projects that never took up the flow.
-  if (!setUp && list.length === 0) return $.ui.status(undefined)
-  const lv = await read($, level)
-  const key = currentStep(lv, list, setUp)
+  if (!setUp && Object.keys(p.steps).length === 0) return $.ui.status(undefined)
+  const key = currentStep(p, setUp)
   $.ui.status(
     key
-      ? `✦ ${LEVELS[lv].icon} 下一步 ${STEPS[key].command} · /matt-flow`
+      ? `✦ ${LEVELS[p.level].icon} 下一步 ${STEPS[key].command} · /matt-flow`
       : '✦ 🎉 這一輪完成 · /matt-flow',
   )
 }
 
 // Marks the steps a skill run finishes; returns the next step's command, if it moved on.
 async function markSkill($: EngineInterface, skill: string) {
-  const before = await read($, done)
+  const before = await read($, progress)
   const fresh = (Object.keys(STEPS) as StepKey[]).filter(
-    key => STEPS[key].skills.includes(skill) && !before.includes(key),
+    key => STEPS[key].skills.includes(skill) && !before.steps[key],
   )
   if (fresh.length === 0) return undefined
-  await update($, done, list => [...list, ...fresh])
+  await update($, progress, p => mark(p, fresh, 'passed'))
   await save($)
-  const lv = await read($, level)
-  const key = currentStep(lv, [...before, ...fresh], await read($, isSetUp))
+  const after = await read($, progress)
+  const key = currentStep(after, await read($, isSetUp))
+  const track = LEVELS[after.level]
   $.ui.toast(
     key
       ? `✔ ${STEPS[fresh[0]!].title} 完成 → 下一步 ${STEPS[key].command}`
-      : `🎉 ${LEVELS[lv].icon} ${LEVELS[lv].name}流程走完一輪！輸入 /matt-flow 看看`,
+      : `🎉 ${track.icon} ${track.name}流程走完一個功能！輸入 /matt-flow 看看`,
   )
 
   return key && STEPS[key].command
 }
 
+// Returns the next step's command, if the skill moved the guide on.
+async function noteSkill($: EngineInterface, name: string) {
+  // A plugin's skill arrives as `mattpocock-skills:to-spec`.
+  const command = await markSkill($, name.split(':').pop() ?? name)
+  await refreshStatus($)
+
+  return command
+}
+
 async function markDone($: EngineInterface, key: StepKey) {
-  await update($, done, list => (list.includes(key) ? list : [...list, key]))
+  await update($, progress, p => mark(p, [key], 'passed'))
   await save($)
   await refreshStatus($)
 }
 
 async function setLevel($: EngineInterface, lv: Level) {
-  await update($, level, () => lv)
+  await update($, progress, p => ({ ...p, level: lv }))
   await save($)
   await refreshStatus($)
 }
 
 async function nextRound($: EngineInterface, lv: Level) {
-  await update($, level, () => lv)
-  await update($, done, () => [])
-  await update($, rounds, n => n + 1)
+  await update($, progress, p => ({ ...p, level: lv, steps: {}, feature: null, features: p.features + 1 }))
   await save($)
   await refreshStatus($)
 }
@@ -264,19 +283,26 @@ export const register: Register = on => {
     return { text: 'Matt 導航已打開。' }
   })
 
-  on('skill.prompt', async ($, e, next) => {
-    // A plugin's skill arrives as `mattpocock-skills:to-spec`.
-    suggestion = (await markSkill($, e.skill.split(':').pop() ?? e.skill)) ?? suggestion
-    await refreshStatus($)
+  // Not `skill.prompt`: the managed security hook skips past user plugins there.
+  // A skill the person typed as `/name`.
+  on('prompt.submit', async ($, e, next) => {
+    if (e.command) suggestion = (await noteSkill($, e.command.name)) ?? suggestion
 
     return next(e)
+  })
+
+  // A skill the model ran through the Skill tool.
+  on('tool.call', { tool: 'Skill' }, async ($, e, next) => {
+    const ran = await next(e)
+    if (ran.deny === undefined && !ran.isError) suggestion = (await noteSkill($, e.skill)) ?? suggestion
+
+    return ran
   })
 
   on('turn.complete', async ($, e, next) => {
     const { context } = await $.session.usage()
     await update($, tokens, () => context.tokens ?? null)
-    const hasSetup = await $.fs.exists(SETUP_FILE)
-    await update($, isSetUp, () => hasSetup)
+    await checkSetup($)
     await refreshStatus($)
     const ran = await next(e)
     if (suggestion !== undefined) {
@@ -307,15 +333,14 @@ export const register: Register = on => {
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text, Button } = $.ui.resolve(e)
-    const lv = await read($, level)
-    const list = await read($, done)
+    const p = await read($, progress)
+    const lv = p.level
     const setUp = await read($, isSetUp)
-    const round = await read($, rounds)
     const fill = await read($, tokens)
     const pending = await read($, unsynced)
     const track = LEVELS[lv]
-    const current = currentStep(lv, list, setUp)
-    const count = track.steps.filter(key => isStepDone(list, key, setUp)).length
+    const current = currentStep(p, setUp)
+    const count = track.steps.filter(key => stateOf(p, key, setUp)).length
     const width = Math.max(8, Math.min(24, (e.props.bodyColumns ?? 40) - 10))
     const filled = bar(count / track.steps.length, width)
     const higher = ORDER[ORDER.indexOf(lv) + 1]
@@ -329,7 +354,7 @@ export const register: Register = on => {
             ✦ Matt 導航
           </Text>
           <Text bold color="inverseText" backgroundColor="claude">
-            {` 第 ${round + 1} 輪 `}
+            {` 已完成 ${p.features} 個功能 `}
           </Text>
         </Box>
 
@@ -360,7 +385,7 @@ export const register: Register = on => {
         <Box flexDirection="column">
           {track.steps.map((key, i) => {
             const step = STEPS[key]
-            const isDone = isStepDone(list, key, setUp)
+            const isDone = stateOf(p, key, setUp) !== undefined
 
             return key === current ? (
               <Box
@@ -400,9 +425,9 @@ export const register: Register = on => {
         {current === undefined && (
           <Box flexDirection="column" borderStyle="double" borderColor="success" paddingX={1}>
             <Text bold color="success">
-              🎉 這一輪完成了！
+              🎉 這個功能完成了！
             </Text>
-            <Text wrap="wrap">{`你已經走完${track.icon} ${track.name}的整套流程，累積 ${round + 1} 輪。`}</Text>
+            <Text wrap="wrap">{`你已經走完${track.icon} ${track.name}的整套流程，這是第 ${p.features + 1} 個功能。`}</Text>
             <Box gap={1} flexWrap="wrap" marginTop={1}>
               <Button key="again" hotkey="1" variant="primary" onPress={() => nextRound($, lv)}>
                 ↻ 做下一個功能
