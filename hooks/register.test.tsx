@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 import type { TestBody } from 'claude-code/testing'
-import type { FsEntry } from 'claude-code'
+import type { FsEntry, UiPane } from 'claude-code'
 
 const REPO = '/repo'
 
@@ -43,8 +43,19 @@ const engine = (on: Parameters<TestBody>[1], { files = SKILLS_REPO, stored }: Wo
   const filled: string[] = []
   const suggested: string[] = []
   const toasts: string[] = []
+  const panes: UiPane[] = []
   on('command.register', () => ({ value: { command: 'matt-flow' } }))
-  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('ui.open', (_, e) => {
+    panes.push({ id: e.id, title: e.title ?? '', isShown: true, isFocused: false, isPlaced: true })
+
+    return { value: { isPlaced: true } }
+  })
+  on('ui.close', (_, e) => {
+    panes.splice(panes.findIndex(pane => pane.id === e.id), 1)
+
+    return { value: undefined }
+  })
+  on('ui.panes', () => ({ value: panes }))
   on('ui.status', () => ({ value: undefined }))
   on('ui.toast', (_, e) => {
     toasts.push(e.text)
@@ -420,6 +431,84 @@ test('a project never set up gets no rail in its system prompt', async ($, on) =
   await start($)
 
   expect(await railSection($)).toBeUndefined()
+})
+
+// The person typing `/matt-flow args`; resolves the line it answers.
+const flow = async ($: Parameters<TestBody>[0], args = '') =>
+  (
+    await $.command.run({
+      command: 'matt-flow',
+      args,
+      origin: { kind: 'composer' },
+      presentation: { isFullscreen: true, columns: 120 },
+    })
+  ).text
+
+test('/matt-flow alone still opens and closes the pane; an unknown argument shows the usage', async ($, on) => {
+  engine(on)
+  await start($)
+
+  expect(await flow($)).toMatch(/已打開/)
+  expect(await flow($)).toMatch(/已關閉/)
+  expect(await flow($, 'nope')).toMatch(/skip.*end.*off.*on/)
+})
+
+test('/matt-flow skip skips the step the flow stands on, and says what is next', async ($, on) => {
+  engine(on)
+  await start($)
+
+  expect(await flow($, 'skip')).toBe('↷ 跳過「把想法問清楚」→ 下一步 /implement')
+  expect(await seen($, /進行中/)).toBe('功能進行中，還沒有規格')
+  expect((await edit($, 'src/app.ts')).deny).toMatch(/\/implement/)
+  expect(await flow($, 'skip')).toBe('↷ 跳過「動手做」→ 下一步 /code-review')
+  expect((await edit($, 'src/app.ts')).deny).toBeUndefined()
+})
+
+test('/matt-flow end, or skipping the retro, ends the feature', async ($, on) => {
+  engine(on)
+  await start($)
+  expect(await flow($, 'end')).toBe('沒有進行中的功能 → 下一步 /grill-with-docs')
+
+  await typed($, 'grill-with-docs')
+  expect(await flow($, 'end')).toBe('🎉 功能結束，已完成 1 個功能 → 下一個從 /grill-with-docs 開始')
+  expect(await seen($, /進行中/)).toBe('還沒有進行中的功能')
+
+  for (const step of ['把想法問清楚', '動手做', '檢查']) expect(await flow($, 'skip')).toMatch(step)
+  expect(await flow($, 'skip')).toBe('🎉 功能結束，已完成 2 個功能 → 下一個從 /grill-with-docs 開始')
+})
+
+test('/matt-flow off quiets the gates and the system prompt in this project; on brings them back', async ($, on) => {
+  engine(on)
+  await start($)
+
+  expect(await flow($, 'off')).toMatch(/關掉了.*\/matt-flow on/)
+  expect((await edit($, 'src/app.ts')).deny).toBeUndefined()
+  expect(await railSection($)).toBeUndefined()
+  await typed($, 'grill-with-docs')
+  await typed($, 'implement')
+  expect((await bash($, 'git commit -m "wip"')).deny).toBeUndefined()
+
+  expect(await flow($, 'on')).toBe('軌道打開了 → 下一步 /grill-with-docs')
+  expect((await edit($, 'src/app.ts')).deny).toMatch(/\/grill-with-docs/)
+  expect(await railSection($)).toBeDefined()
+})
+
+test('in a project never set up, the subcommands say why the rail does nothing', async ($, on) => {
+  engine(on, { files: {} })
+  await start($)
+
+  expect(await flow($, 'skip')).toMatch(/還沒設定.*\/setup-matt-pocock-skills/)
+})
+
+test('typing a later step runs it all the same, skipping the steps before it with a toast', async ($, on) => {
+  const { toasts } = engine(on, { files: GITHUB, stored: { level: 'intermediate' } })
+  await start($)
+  await typed($, 'implement')
+
+  expect(toasts).toEqual(['↷ 跳過「把想法問清楚」「寫成規格書」「切成任務卡」 · ✔ 動手做 通過 → 下一步 /retro'])
+  expect((await edit($, 'src/app.ts')).deny).toBeUndefined()
+  await typed($, 'grill-with-docs')
+  expect(toasts.at(-1)).toBe('✔ 把想法問清楚 通過 → 下一步 /retro')
 })
 
 test('an em-dash is denied inside the skills repo only', async ($, on) => {

@@ -190,10 +190,14 @@ async function load($: EngineInterface, cwd: string) {
   await update($, progress, () => restore(saved, now))
 }
 
-// The rail stays out of projects never set up, and ones the person turned it off in.
-async function isQuiet($: EngineInterface) {
-  return !(await read($, isSetUp)) || (await read($, progress)).isOff
+// Why the rail stays out of this project (never set up, or turned off), or undefined while it is on.
+async function quietLine($: EngineInterface) {
+  if (!(await read($, isSetUp))) return `這個專案還沒設定，軌道沒有作用：先輸入 ${STEPS.setup.command}`
+  if ((await read($, progress)).isOff) return '軌道在這個專案關著：輸入 /matt-flow on 打開'
+
+  return undefined
 }
+const isQuiet = async ($: EngineInterface) => (await quietLine($)) !== undefined
 
 async function isLocalTracker($: EngineInterface) {
   const text = await $.fs.read(`${await read($, project)}/${SETUP_FILE}`).catch(() => '')
@@ -214,24 +218,31 @@ async function refreshStatus($: EngineInterface) {
   $.ui.status(`✦ ${LEVELS[p.level].icon} 下一步 ${STEPS[key].command} · /matt-flow`)
 }
 
-async function handOver($: EngineInterface, title: string) {
-  const key = currentStep(await read($, progress), await read($, isSetUp))
-  if (key === undefined) return
-  suggestion = STEPS[key].command
-  $.ui.toast(`✔ ${title} 通過 → 下一步 ${suggestion}`)
+const nextCommand = async ($: EngineInterface) =>
+  STEPS[currentStep(await read($, progress), await read($, isSetUp)) ?? 'grill'].command
+
+async function endFeature($: EngineInterface) {
+  await update($, progress, finish)
+
+  return `🎉 功能結束，已完成 ${(await read($, progress)).features} 個功能 → 下一個從 ${STEPS.grill.command} 開始`
 }
 
-// Passes the steps not passed or skipped yet and hands over to the next one.
-// Passing the retro ends the feature.
-async function pass($: EngineInterface, keys: StepKey[]) {
+// Passes the steps not passed yet (a skipped one too, once it is done after all)
+// and hands over to the next one; `note` leads the toast. Passing the retro ends the feature.
+async function pass($: EngineInterface, keys: StepKey[], note?: string) {
   const before = await read($, progress)
-  const fresh = keys.filter(key => !before.steps[key])
-  if (fresh.length === 0) return
+  const fresh = keys.filter(key => before.steps[key] !== 'passed')
+  if (fresh.length === 0) {
+    if (note) $.ui.toast(note)
+    return
+  }
   await update($, progress, p => mark(p, fresh, 'passed'))
-  if (!fresh.includes('retro')) return handOver($, STEPS[fresh[0]!].title)
-  await update($, progress, finish)
-  suggestion = STEPS.grill.command
-  $.ui.toast(`🎉 功能完成！已完成 ${before.features + 1} 個功能 → 下一個從 ${suggestion} 開始`)
+  const said = fresh.includes('retro')
+    ? await endFeature($)
+    : `✔ ${STEPS[fresh[0]!].title} 通過 → 下一步 ${await nextCommand($)}`
+  // The hand-over: the next step's command, offered in the prompt box once the turn ends.
+  suggestion = await nextCommand($)
+  $.ui.toast(note ? `${note} · ${said}` : said)
 }
 
 // A skill ran: typed by the person, or run by the model through the Skill tool.
@@ -242,8 +253,18 @@ async function noteSkill($: EngineInterface, name: string, byPerson: boolean) {
   if (keys.length === 0 || (await isQuiet($))) return
   const now = await $.clock.now()
   await update($, progress, p => (p.feature ? p : { ...p, feature: { name: null, since: now } }))
+  // The person typing a later step's command skips the steps before it they have not passed.
+  const p = await read($, progress)
+  const order = LEVELS[p.level].steps
+  const typed = byPerson ? keys.find(key => order.includes(key)) : undefined
+  const skipped = typed ? order.slice(0, order.indexOf(typed)).filter(key => !stateOf(p, key, true)) : []
+  if (skipped.length > 0) await update($, progress, q => mark(q, skipped, 'skipped'))
   const isLocal = await isLocalTracker($)
-  await pass($, keys.filter(key => (BUILD.includes(key) ? byPerson : !(isLocal && ARTIFACTS.includes(key)))))
+  await pass(
+    $,
+    keys.filter(key => (BUILD.includes(key) ? byPerson : !(isLocal && ARTIFACTS.includes(key)))),
+    skipped.length > 0 ? `↷ 跳過${skipped.map(key => `「${STEPS[key].title}」`).join('')}` : undefined,
+  )
   // One review per build: the fixes after it commit without another.
   if (keys.includes('review')) await update($, progress, p => (isBuilding(p) ? { ...p, isReviewed: true } : p))
   await save($)
@@ -319,6 +340,42 @@ async function railPrompt($: EngineInterface) {
   ].join('\n')
 }
 
+// `/matt-flow skip`: the step the flow stands on counts as passed, without its artifact.
+async function skipStep($: EngineInterface) {
+  const quiet = await quietLine($)
+  if (quiet) return quiet
+  const now = await $.clock.now()
+  const key = currentStep(await read($, progress), true) ?? 'grill'
+  await update($, progress, p => ({ ...mark(p, [key], 'skipped'), feature: p.feature ?? { name: null, since: now } }))
+  const line = key === 'retro' ? await endFeature($) : `↷ 跳過「${STEPS[key].title}」→ 下一步 ${await nextCommand($)}`
+  await save($)
+  await refreshStatus($)
+
+  return line
+}
+
+// `/matt-flow end`: the person closes the feature, done or abandoned.
+async function stopFeature($: EngineInterface) {
+  const quiet = await quietLine($)
+  if (quiet) return quiet
+  if ((await read($, progress)).feature === null) return `沒有進行中的功能 → 下一步 ${await nextCommand($)}`
+  const line = await endFeature($)
+  await save($)
+  await refreshStatus($)
+
+  return line
+}
+
+// `/matt-flow off` and `on`, for this project.
+async function setOff($: EngineInterface, isOff: boolean) {
+  await update($, progress, p => ({ ...p, isOff }))
+  await save($)
+  await refreshStatus($)
+  if (isOff) return '軌道在這個專案關掉了：不擋程式碼和 commit，也不交棒。輸入 /matt-flow on 再打開'
+
+  return (await quietLine($)) ?? `軌道打開了 → 下一步 ${await nextCommand($)}`
+}
+
 async function markDone($: EngineInterface, key: StepKey) {
   await pass($, [key])
   await save($)
@@ -372,14 +429,29 @@ export const register: Register = on => {
     await load($, e.cwd)
     await $.command.register({
       name: 'matt-flow',
-      description: '打開或關閉 Matt 導航：一步一步帶你走 Matt Pocock 的開發流程',
+      description: '打開或關閉 Matt 導航；skip 跳過目前的步驟，end 結束功能，off／on 關閉或打開這個專案的軌道',
+      argumentHint: 'skip | end | off | on',
     })
     await refreshStatus($)
 
     return next(e)
   })
 
-  on('command.run', { command: 'matt-flow' }, async $ => {
+  on('command.run', { command: 'matt-flow' }, async ($, e) => {
+    switch (e.args.trim()) {
+      case '':
+        break
+      case 'skip':
+        return { text: await skipStep($) }
+      case 'end':
+        return { text: await stopFeature($) }
+      case 'off':
+        return { text: await setOff($, true) }
+      case 'on':
+        return { text: await setOff($, false) }
+      default:
+        return { text: '用法：/matt-flow 打開或關閉面板；/matt-flow skip、end、off、on' }
+    }
     if ((await $.ui.panes()).some(pane => pane.id === PANE)) {
       await $.ui.close({ id: PANE })
 
@@ -411,7 +483,10 @@ export const register: Register = on => {
     await update($, tokens, () => context.tokens ?? null)
     const wasSetUp = await read($, isSetUp)
     await checkSetup($)
-    if (!wasSetUp && !(await isQuiet($))) await handOver($, STEPS.setup.title)
+    if (!wasSetUp && !(await isQuiet($))) {
+      suggestion = await nextCommand($)
+      $.ui.toast(`✔ ${STEPS.setup.title} 通過 → 下一步 ${suggestion}`)
+    }
     await checkArtifacts($)
     await save($)
     await refreshStatus($)
