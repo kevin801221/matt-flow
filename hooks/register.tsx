@@ -108,6 +108,10 @@ const LEVELS: Record<Level, { icon: string; name: string; goal: string; steps: S
 const ORDER: Level[] = ['beginner', 'intermediate', 'expert']
 // Each level's building: only the person typing its command passes it.
 const BUILD: StepKey[] = ['build', 'parallel']
+// The steps after building: typed before it, they move nothing.
+const LATE: StepKey[] = ['review', 'pr', 'retro']
+// Steps that go on for turns after their skill starts, and when each is done: they hand over then, not on starting.
+const MANY_TURNS: Partial<Record<StepKey, string>> = { grill: '問題問完', tickets: '任務卡切好', parallel: '分身都合併' }
 // With the local tracker these pass on their files, not on their skill running.
 const ARTIFACTS: StepKey[] = ['spec', 'tickets']
 
@@ -116,7 +120,15 @@ const ARTIFACTS: StepKey[] = ['spec', 'tickets']
 const SYNC_TARGET = /^(README\.md|\.claude-plugin\/plugin\.json|docs\/|skills\/engineering\/ask-matt\/)/
 const PROMOTED = /^skills\/(?:engineering|productivity)\/([^/]+)\//
 
-const FRESH: Progress = { level: 'beginner', steps: {}, feature: null, isReviewed: false, isOff: false, features: 0 }
+const FRESH: Progress = {
+  level: 'beginner',
+  steps: {},
+  feature: null,
+  isReviewed: false,
+  isOff: false,
+  isWrappingUp: false,
+  features: 0,
+}
 
 const project = atom({ plugin: 'matt-flow', key: 'project' } as const, null)
 const progress = atom({ plugin: 'matt-flow', key: 'progress' } as const, FRESH)
@@ -126,32 +138,51 @@ const unsynced = atom({ plugin: 'matt-flow', key: 'unsynced' } as const, [])
 
 // The next step's command, offered in the prompt box once the turn ends.
 let suggestion: string | undefined
-// Whether prompt.compose reaches this module. A managed hook may send it past
-// user plugins, as it does skill.prompt; until it arrives, the rail rides along with each prompt.
-let isComposed = false
+// The rail last sent beside a prompt: it rides along again only once it changes, or once the
+// conversation holding it is compacted or ended. Not in the system prompt: a managed hook may send
+// prompt.compose past user plugins, as it does skill.prompt.
+let sent: string | undefined
 
 const stateOf = (p: Progress, key: StepKey, setUp: boolean): StepState | undefined =>
   key === 'setup' && setUp ? 'passed' : p.steps[key]
-const currentStep = (p: Progress, setUp: boolean) => LEVELS[p.level].steps.find(key => !stateOf(p, key, setUp))
+// The first step not passed: the one whose command the person types next. A step passes as its
+// skill starts, so this is never the one under way.
+const nextStep = (p: Progress, setUp: boolean) => LEVELS[p.level].steps.find(key => !stateOf(p, key, setUp))
 const mark = (p: Progress, keys: StepKey[], state: StepState): Progress => ({
   ...p,
   steps: { ...p.steps, ...Object.fromEntries(keys.map(key => [key, state] as const)) },
 })
 const isBuilding = (p: Progress) => BUILD.some(key => p.steps[key])
-// The step whose command unlocks code: grilling without a feature, else the one it stands on.
-const unlockStep = (p: Progress) => (p.feature && currentStep(p, true)) || 'grill'
+// The step whose command unlocks code: grilling without a feature, else the next one.
+const unlockStep = (p: Progress) => (p.feature && nextStep(p, true)) || 'grill'
 // A `git commit`, however git is pointed (`git -C dir commit`).
 const GIT_COMMIT = /\bgit(?:\s+-[cC]\s+\S+)*\s+commit\b/
 // Beginners and intermediates commit what they build only after code-review has run.
 const isCommitLocked = (p: Progress) => p.level !== 'expert' && isBuilding(p) && !p.isReviewed
-const featureLine = ({ feature }: Progress) =>
-  feature === null ? '還沒有進行中的功能' : feature.name === null ? '功能進行中' : `功能「${feature.name}」進行中`
+// Code opens once building starts, and stays open through the wrap-up.
+const isCodeOpen = (p: Progress) => isBuilding(p) || p.isWrappingUp
+const WRAP_UP = '改完環境輸入 /matt-flow end'
+// Intermediate building goes a ticket at a time: until the person starts the retro, the next is either.
+const NEXT_TICKET = '還有任務卡就 /clear 後 /implement 下一張，都做好了再 /retro'
+const isTicketByTicket = (p: Progress) => p.level === 'intermediate' && p.steps.build === 'passed'
+const featureLine = ({ feature, isWrappingUp }: Progress) =>
+  feature !== null
+    ? feature.name === null
+      ? '功能進行中'
+      : `功能「${feature.name}」進行中`
+    : isWrappingUp
+      ? `收尾中：${WRAP_UP}`
+      : '還沒有進行中的功能'
 // What the rail guards: a project file that is not markdown, outside the tracker's folder and docs.
 // ponytail: `..` is not resolved; the gate keeps Claude on the flow, it is no sandbox (Bash gets past it anyway).
-const isCode = (cwd: string, path: string) =>
-  path.startsWith(`${cwd}/`) &&
+const isCode = (root: string, path: string) =>
+  path.startsWith(`${root}/`) &&
   !/\.md$/i.test(path) &&
-  ![`${SCRATCH}/`, 'docs/'].some(dir => path.startsWith(`${cwd}/${dir}`))
+  ![`${SCRATCH}/`, 'docs/'].some(dir => path.startsWith(`${root}/${dir}`))
+// What a gate that throws still holds: it cannot tell the project, so it judges the path alone.
+const mayBeCode = (path: string) => !/\.md$/i.test(path) && ![`/${SCRATCH}/`, '/docs/'].some(dir => path.includes(dir))
+const BROKEN =
+  "matt-flow：關卡出錯，先擋下改程式碼和 commit。停下來告訴人：把 matt-flow 退回上一個能用的版本（git -C ~/.claude/skills/matt-flow reset --hard 'HEAD@{1}'），或把它移出 skills 資料夾；/matt-flow off 讀的是同一份狀態，可能也沒用。"
 // Ends the feature: it counts, and every step but setup starts over.
 const finish = (p: Progress): Progress => ({
   ...p,
@@ -189,12 +220,30 @@ async function checkSetup($: EngineInterface) {
   await update($, isSetUp, () => hasSetup)
 }
 
-async function load($: EngineInterface, cwd: string) {
-  await update($, project, () => cwd)
-  await checkSetup($)
-  const saved = (await $.store.get(`progress:${cwd}`)) as Saved | undefined
+// The nearest folder at or above `cwd` that is set up, else `cwd`: a session opened in a
+// subfolder works on its project, and a linked worktree with its own checkout is a project of its own.
+async function projectRoot($: EngineInterface, cwd: string) {
+  for (let dir = cwd; dir !== ''; dir = dir.slice(0, dir.lastIndexOf('/'))) {
+    if (await $.fs.exists(`${dir}/${SETUP_FILE}`)) return dir
+  }
+
+  return cwd
+}
+
+// Another session of the project may have moved it on: read it afresh before acting on it.
+// ponytail: $.store has no compare-and-set, so a write another session lands between this read and the save after it is lost.
+async function reread($: EngineInterface) {
+  const key = await read($, project)
+  if (key === null) return
+  const saved = (await $.store.get(`progress:${key}`)) as Saved | undefined
   const now = await $.clock.now()
   await update($, progress, () => restore(saved, now))
+}
+
+async function load($: EngineInterface, root: string) {
+  await update($, project, () => root)
+  await checkSetup($)
+  await reread($)
 }
 
 // Why the rail stays out of this project (never set up, or turned off), or undefined while it is on.
@@ -220,42 +269,55 @@ async function refreshStatus($: EngineInterface) {
     return $.ui.status(`${pending.join(', ')} 改了 → 同步 README · plugin.json · docs · ask-matt`)
   }
   const p = await read($, progress)
-  const key = currentStep(p, await read($, isSetUp))
+  const key = nextStep(p, await read($, isSetUp))
   if (key === undefined || (await isQuiet($))) return $.ui.status(undefined)
-  $.ui.status(`✦ ${LEVELS[p.level].icon} 下一步 ${STEPS[key].command} · /matt-flow`)
+  const icon = LEVELS[p.level].icon
+  const next = isTicketByTicket(p) ? '/implement 下一張，或 /retro' : STEPS[key].command
+  $.ui.status(p.isWrappingUp ? `✦ ${icon} 收尾中 · ${WRAP_UP}` : `✦ ${icon} 下一步 ${next} · /matt-flow`)
 }
 
 const nextCommand = async ($: EngineInterface) =>
-  STEPS[currentStep(await read($, progress), await read($, isSetUp)) ?? 'grill'].command
+  STEPS[nextStep(await read($, progress), await read($, isSetUp)) ?? 'grill'].command
 
-async function endFeature($: EngineInterface) {
-  await update($, progress, finish)
+// The retro's ending opens the wrap-up; the person ending the feature, or skipping its retro, does not.
+async function endFeature($: EngineInterface, isWrapUp = false) {
+  await update($, progress, p => ({ ...finish(p), isWrappingUp: isWrapUp }))
+  const then = isWrapUp ? `收尾：${WRAP_UP}，下一個` : '下一個'
 
-  return `🎉 功能結束，已完成 ${(await read($, progress)).features} 個功能 → 下一個從 ${STEPS.grill.command} 開始`
+  return `🎉 功能結束，已完成 ${(await read($, progress)).features} 個功能 → ${then}從 ${STEPS.grill.command} 開始`
 }
 
 // Passes the steps not passed yet (a skipped one too, once it is done after all)
 // and hands over to the next one; `note` leads the toast. A step outside the
-// level passes quietly. Passing the retro ends the feature.
-async function pass($: EngineInterface, keys: StepKey[], note?: string) {
+// level passes quietly. Passing the retro ends the feature. A step that takes
+// many turns, passed as its skill starts, hands over once done: nothing is suggested.
+async function pass($: EngineInterface, keys: StepKey[], note?: string, isStart = false) {
   const before = await read($, progress)
   const fresh = keys.filter(key => before.steps[key] !== 'passed')
   if (fresh.length > 0) await update($, progress, p => mark(p, fresh, 'passed'))
   const own = fresh.filter(key => LEVELS[before.level].steps.includes(key))
   if (own.length === 0) {
+    if (fresh.length > 0) await save($)
     if (note) $.ui.toast(note)
     return
   }
-  const said = own.includes('retro')
-    ? await endFeature($)
-    : `✔ ${STEPS[own[0]!].title} 通過 → 下一步 ${await nextCommand($)}`
-  suggestion = await nextCommand($)
+  const long = isStart ? own.find(key => MANY_TURNS[key] !== undefined) : undefined
+  const isRetro = own.includes('retro')
+  const isByTicket = !isRetro && isTicketByTicket(await read($, progress))
+  const then = isByTicket ? NEXT_TICKET : `下一步 ${await nextCommand($)}`
+  const said = isRetro
+    ? await endFeature($, true)
+    : long !== undefined
+      ? `▶ 開始「${STEPS[long].title}」：${MANY_TURNS[long]}之後，${then}`
+      : `✔ ${STEPS[own[0]!].title} 通過 → ${then}`
+  suggestion = long !== undefined || isByTicket ? undefined : await nextCommand($)
+  await save($)
   $.ui.toast(note ? `${note} · ${said}` : said)
 }
 
 async function startFeature($: EngineInterface) {
   const now = await $.clock.now()
-  await update($, progress, p => (p.feature ? p : { ...p, feature: { name: null, since: now } }))
+  await update($, progress, p => (p.feature ? p : { ...p, feature: { name: null, since: now }, isWrappingUp: false }))
 }
 
 // A skill ran: typed by the person, or run by the model through the Skill tool.
@@ -263,7 +325,12 @@ async function noteSkill($: EngineInterface, name: string, byPerson: boolean) {
   // A plugin's skill arrives as `mattpocock-skills:to-spec`.
   const skill = name.split(':').pop() ?? name
   const keys = (Object.keys(STEPS) as StepKey[]).filter(key => STEPS[key].skills.includes(skill))
-  if (keys.length === 0 || (await isQuiet($))) return
+  if (keys.length === 0) return
+  await reread($)
+  if (await isQuiet($)) return
+  // Only the person starts a feature, and nothing reaches past building before it has begun.
+  const was = await read($, progress)
+  if ((was.feature === null && !byPerson) || (!isBuilding(was) && keys.every(key => LATE.includes(key)))) return
   await startFeature($)
   // The person typing a later step's command skips the steps before it they have not passed.
   const p = await read($, progress)
@@ -276,6 +343,7 @@ async function noteSkill($: EngineInterface, name: string, byPerson: boolean) {
     $,
     keys.filter(key => (BUILD.includes(key) ? byPerson : !(isLocal && ARTIFACTS.includes(key)))),
     skipped.length > 0 ? `↷ 跳過${skipped.map(key => `「${STEPS[key].title}」`).join('')}` : undefined,
+    true,
   )
   // One review per build, and each /implement the person types is a build; the fixes after a review commit without another.
   if (byPerson && keys.some(key => BUILD.includes(key))) await update($, progress, p => ({ ...p, isReviewed: false }))
@@ -311,31 +379,39 @@ async function checkArtifacts($: EngineInterface) {
 // Why editing `path` is denied, or undefined while it may go ahead. The unlock
 // command is offered to the person too.
 async function codeGate($: EngineInterface, path: string) {
-  const cwd = await read($, project)
+  const root = await read($, project)
+  // Quiet first: as long as the state reads at all, /matt-flow off holds.
+  if (root === null || (await isQuiet($)) || !isCode(root, path)) return undefined
   const p = await read($, progress)
-  if (cwd === null || !isCode(cwd, path) || isBuilding(p) || (await isQuiet($))) return undefined
+  if (isCodeOpen(p)) return undefined
   const key = unlockStep(p)
   suggestion = STEPS[key].command
 
-  return `matt-flow：還沒到動手做，程式碼鎖著。目前的步驟是「${STEPS[key].title}」，解鎖要由人輸入 ${suggestion}（已預填在輸入框）。停下來交棒：把這個指令告訴人，然後結束這次回覆。不要改用 Bash 或其他方式寫這個檔案。`
+  return `matt-flow：還沒到動手做，程式碼鎖著。下一步是「${STEPS[key].title}」，解鎖要由人輸入 ${suggestion}（已預填在輸入框）。停下來交棒：把這個指令告訴人，然後結束這次回覆。不要改用 Bash 或其他方式寫這個檔案。`
 }
 
-// Why running `command` is denied, or undefined while it may go ahead.
-async function commitGate($: EngineInterface, command: string) {
-  if (!GIT_COMMIT.test(command) || !isCommitLocked(await read($, progress)) || (await isQuiet($))) return undefined
+// Why running `command` is denied, or undefined while it may go ahead. A subagent
+// of /implement-spec commits its ticket: the person started that run.
+async function commitGate($: EngineInterface, command: string, isAgent: boolean) {
+  if (!GIT_COMMIT.test(command) || (await isQuiet($))) return undefined
+  const p = await read($, progress)
+  if ((isAgent && p.steps.parallel) || !isCommitLocked(p)) return undefined
   suggestion = STEPS.review.command
 
   return 'matt-flow：這次動手做還沒跑過 code-review，先不能 commit。先用 Skill 工具跑 code-review（或請人輸入 /code-review），跑過之後的 commit 都會放行。不要繞過這個阻擋。'
 }
 
-// Claude's own map of the rail, last in its system prompt: where the flow
-// stands, what is locked and how it unlocks, and how to hand over.
+// Claude's own map of the rail, sent beside the person's prompt: where the flow
+// stands, what is locked and how it unlocks, what still goes, and how to hand over.
 async function railPrompt($: EngineInterface) {
   if (await isQuiet($)) return undefined
   const p = await read($, progress)
-  const step = STEPS[currentStep(p, true) ?? 'grill']
+  const step = STEPS[nextStep(p, true) ?? 'grill']
+  const isByTicket = isTicketByTicket(p)
   const locks = [
-    ...(isBuilding(p) ? [] : [`改程式碼（Edit、Write、NotebookEdit）：由人輸入 ${STEPS[unlockStep(p)].command} 解鎖`]),
+    ...(isCodeOpen(p)
+      ? []
+      : [`改程式碼（Edit、Write、NotebookEdit）：由人輸入 ${STEPS[unlockStep(p)].command} 解鎖`]),
     ...(isCommitLocked(p) ? ['git commit：先跑 code-review（Skill 工具，或請人輸入 /code-review）'] : []),
   ]
 
@@ -345,22 +421,26 @@ async function railPrompt($: EngineInterface) {
     '這個專案照 Matt Pocock 的流程走，由 matt-flow 把關，人輸入每一步的指令。',
     `- ${featureLine(p)}`,
     `- 等級：${LEVELS[p.level].name}`,
-    `- 目前的步驟：${step.title}（${step.command}）`,
+    `- 下一步：${isByTicket ? NEXT_TICKET : `${step.title}（${step.command}）`}`,
     `- 現在會被擋的動作：${locks.length === 0 ? '沒有' : ''}`,
     ...locks.map(lock => `  - ${lock}`),
+    ...(isCodeOpen(p)
+      ? []
+      : ['- 仍可以：讀檔、跑測試、改 markdown、docs/、.scratch/；跟目前功能無關的修改，請人決定要不要 /matt-flow off']),
     '',
     '規矩：',
-    `- 交棒：做完人這次啟動的工作，或改程式碼被擋下時，就停下來，把下一步的指令（現在是 ${step.command}）告訴人，然後結束這次回覆；由人輸入，不要自己往下做。`,
-    '- 除了下一步的指令，不要建議其他流程指令。',
+    `- 交棒：人這次啟動的 skill 整個做完（不是它一開始），或改程式碼被擋下時，就停下來，把下一步的指令（現在是 ${isByTicket ? NEXT_TICKET : step.command}）告訴人，然後結束這次回覆；由人輸入，不要自己往下做。`,
+    '- 除了下一步的指令和 /matt-flow，不要主動建議流程指令；人輸入 /ask-matt 時，照 ask-matt 回答。',
     '- 絕不繞過任何阻擋，包括改用 Bash 寫檔或 commit。',
   ].join('\n')
 }
 
 // `/matt-flow skip`: the step the flow stands on counts as passed, without its artifact.
 async function skipStep($: EngineInterface) {
+  await reread($)
   const quiet = await quietLine($)
   if (quiet) return quiet
-  const key = currentStep(await read($, progress), true) ?? 'grill'
+  const key = nextStep(await read($, progress), true) ?? 'grill'
   await startFeature($)
   await update($, progress, p => mark(p, [key], 'skipped'))
   const line = key === 'retro' ? await endFeature($) : `↷ 跳過「${STEPS[key].title}」→ 下一步 ${await nextCommand($)}`
@@ -372,9 +452,18 @@ async function skipStep($: EngineInterface) {
 
 // `/matt-flow end`: the person closes the feature, done or abandoned.
 async function stopFeature($: EngineInterface) {
+  await reread($)
   const quiet = await quietLine($)
   if (quiet) return quiet
-  if ((await read($, progress)).feature === null) return `沒有進行中的功能 → 下一步 ${await nextCommand($)}`
+  const p = await read($, progress)
+  if (p.feature === null && p.isWrappingUp) {
+    await update($, progress, q => ({ ...q, isWrappingUp: false }))
+    await save($)
+    await refreshStatus($)
+
+    return `收尾結束 → 下一步 ${await nextCommand($)}`
+  }
+  if (p.feature === null) return `沒有進行中的功能 → 下一步 ${await nextCommand($)}`
   const line = await endFeature($)
   await save($)
   await refreshStatus($)
@@ -384,6 +473,7 @@ async function stopFeature($: EngineInterface) {
 
 // `/matt-flow off` and `on`, for this project.
 async function setOff($: EngineInterface, isOff: boolean) {
+  await reread($)
   await update($, progress, p => ({ ...p, isOff }))
   await save($)
   await refreshStatus($)
@@ -392,8 +482,16 @@ async function setOff($: EngineInterface, isOff: boolean) {
   return (await quietLine($)) ?? `軌道打開了 → 下一步 ${await nextCommand($)}`
 }
 
+// Mid-build, the new level's steps up to its own building count as skipped, so the flow goes on from there.
 async function setLevel($: EngineInterface, lv: Level) {
-  await update($, progress, p => ({ ...p, level: lv }))
+  await reread($)
+  await update($, progress, p => {
+    if (!isBuilding(p)) return { ...p, level: lv }
+    const order = LEVELS[lv].steps
+    const upTo = order.slice(0, order.findIndex(key => BUILD.includes(key)) + 1)
+
+    return mark({ ...p, level: lv }, upTo.filter(key => !stateOf(p, key, true)), 'skipped')
+  })
   await save($)
   await refreshStatus($)
 }
@@ -401,6 +499,8 @@ async function setLevel($: EngineInterface, lv: Level) {
 async function askMatt($: EngineInterface, lv: Level, key: StepKey) {
   await $.prompt.fill({
     text: `/ask-matt 我在 Matt 導航的「${LEVELS[lv].name}」流程，卡在「${STEPS[key].title}」(${STEPS[key].command})。我遇到的狀況是：`,
+    // A draft the person was writing stays.
+    mode: 'insert',
   })
 }
 
@@ -415,9 +515,9 @@ async function noteWrite($: EngineInterface, rel: string) {
   await refreshStatus($)
 }
 
-async function isSkillsRepo($: EngineInterface, cwd: string) {
+async function isSkillsRepo($: EngineInterface, root: string) {
   try {
-    return JSON.parse(await $.fs.read(`${cwd}/.claude-plugin/plugin.json`)).name === 'mattpocock-skills'
+    return JSON.parse(await $.fs.read(`${root}/.claude-plugin/plugin.json`)).name === 'mattpocock-skills'
   } catch {
     return false
   }
@@ -431,11 +531,12 @@ export const register: Register = on => {
     `${name}: no ${EM_DASH} in this repo (CLAUDE.md). Rewrite the sentence with a comma, colon, period, parentheses or a conjunction, whichever it wants; never a blind character swap.`
 
   on('session.start', async ($, e, next) => {
-    repoRoot = (await isSkillsRepo($, e.cwd)) ? e.cwd : null
-    await load($, e.cwd)
+    const root = await projectRoot($, e.cwd)
+    repoRoot = (await isSkillsRepo($, root)) ? root : null
+    await load($, root)
     await $.command.register({
       name: 'matt-flow',
-      description: '打開或關閉 Matt 導航；skip 跳過目前的步驟，end 結束功能，off／on 關閉或打開這個專案的軌道',
+      description: '打開或關閉 Matt 導航；skip 跳過下一步，end 結束功能或收尾，off／on 關閉或打開這個專案的軌道',
       argumentHint: 'skip | end | off | on',
     })
     await refreshStatus($)
@@ -469,30 +570,54 @@ export const register: Register = on => {
   })
 
   // Not `skill.prompt`: the managed security hook skips past user plugins there.
-  // A skill the person typed as `/name`.
+  // A skill the person typed as `/name`. Fails open on purpose: it notes and
+  // reminds, and must never refuse what the person typed.
   on('prompt.submit', async ($, e, next) => {
+    await reread($)
     if (e.command) await noteSkill($, e.command.name, true)
-    const rail = isComposed ? undefined : await railPrompt($)
+    const rail = await railPrompt($)
+    if (rail === sent) return next(e)
+    // A rail taken back says so: the old one stays in the conversation, still telling Claude to stop.
+    const line = rail ?? 'matt-flow 軌道在這個專案停用了，先前的規矩不再適用。'
+    sent = rail
 
-    return next(rail === undefined ? e : { ...e, context: [...(e.context ?? []), rail] })
+    return next({ ...e, context: [...(e.context ?? []), line] })
   })
 
-  // A skill the model ran through the Skill tool.
+  on('session.compact', async ($, e, next) => {
+    const ran = await next(e)
+    // `precompute` installs nothing; a subagent's compaction leaves the main conversation alone.
+    if (e.agentId === undefined && e.trigger !== 'precompute') sent = undefined
+
+    return ran
+  })
+
+  // ponytail: a rewind (esc esc) raises no event; a rail rewound away comes back only once it changes.
+  on('session.end', async ($, e, next) => {
+    sent = undefined
+
+    return next(e)
+  })
+
+  // A skill the model ran through the Skill tool; a subagent's moves nothing, only the main thread does.
+  // Fails open on purpose: it only notes.
   on('tool.call', { tool: 'Skill' }, async ($, e, next) => {
     const ran = await next(e)
-    if (ran.deny === undefined && !ran.isError) await noteSkill($, e.skill, false)
+    if (ran.deny === undefined && !ran.isError && e.agentId === undefined) await noteSkill($, e.skill, false)
 
     return ran
   })
 
   on('turn.complete', async ($, e, next) => {
+    // A subagent's turn ending is no hand-over: the person is waiting on the main thread.
+    if (e.agentId !== undefined) return next(e)
     const { context } = await $.session.usage()
     await update($, tokens, () => context.tokens ?? null)
+    await reread($)
     const wasSetUp = await read($, isSetUp)
     await checkSetup($)
     if (!wasSetUp && !(await isQuiet($))) await pass($, ['setup'])
     await checkArtifacts($)
-    await save($)
     await refreshStatus($)
     const ran = await next(e)
     if (suggestion !== undefined) {
@@ -512,7 +637,7 @@ export const register: Register = on => {
     if (ran.deny === undefined && !ran.isError) await noteWrite($, e.file_path.slice(`${repoRoot}/`.length))
 
     return ran
-  })
+  }).catch(($, e, next) => (next.called ? next(e) : mayBeCode(e.file_path) ? { deny: BROKEN } : next(e)))
 
   on('tool.call', { tool: 'Write' }, async ($, e, next) => {
     const locked = await codeGate($, e.file_path)
@@ -523,27 +648,19 @@ export const register: Register = on => {
     if (ran.deny === undefined && !ran.isError) await noteWrite($, e.file_path.slice(`${repoRoot}/`.length))
 
     return ran
-  })
-
-  on('prompt.compose', async ($, e, next) => {
-    isComposed = true
-    const composed = await next(e)
-    const text = await railPrompt($)
-
-    return text === undefined ? composed : { sections: [...composed.sections, { id: 'matt-flow:rail', text, scope: 'session' }] }
-  })
+  }).catch(($, e, next) => (next.called ? next(e) : mayBeCode(e.file_path) ? { deny: BROKEN } : next(e)))
 
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
-    const locked = await commitGate($, e.command)
+    const locked = await commitGate($, e.command, e.agentId !== undefined)
 
     return locked ? { deny: locked } : next(e)
-  })
+  }).catch(($, e, next) => (next.called ? next(e) : GIT_COMMIT.test(e.command) ? { deny: BROKEN } : next(e)))
 
   on('tool.call', { tool: 'NotebookEdit' }, async ($, e, next) => {
     const locked = await codeGate($, e.notebook_path)
 
     return locked ? { deny: locked } : next(e)
-  })
+  }).catch(($, e, next) => (next.called ? next(e) : mayBeCode(e.notebook_path) ? { deny: BROKEN } : next(e)))
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text, Button } = $.ui.resolve(e)
@@ -554,7 +671,7 @@ export const register: Register = on => {
     const pending = await read($, unsynced)
     const quiet = await quietLine($)
     const track = LEVELS[lv]
-    const current = currentStep(p, setUp)
+    const upNext = nextStep(p, setUp)
     const count = track.steps.filter(key => stateOf(p, key, setUp)).length
     const width = Math.max(8, Math.min(24, (e.props.bodyColumns ?? 40) - 10))
     const filled = bar(count / track.steps.length, width)
@@ -610,7 +727,7 @@ export const register: Register = on => {
             const step = STEPS[key]
             const state = stateOf(p, key, setUp)
 
-            return key === current ? (
+            return key === upNext ? (
               <Box
                 key={key}
                 flexDirection="column"
