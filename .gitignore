@@ -1,2 +1,4 @@
 # Screenshots capture the whole screen: keep them local.
 .scratch/*/evidence/
+# Personal Claude Code settings for this project.
+.claude/settings.local.json

@@ -1,7 +1,9 @@
 #!/bin/sh
-# Validates the mod and runs its tests before each commit, quiet unless one fails.
+# Validates the mod, runs its tests and type-checks it before each commit; it speaks only
+# when one fails or the type check has no types to use.
 # A clone turns it on once: git config core.hooksPath .githooks
 # ponytail: checks the working tree, not only what is staged; stash the rest first when the two differ.
 for check in validate test; do
   out=$(claude plugin "$check" . 2>&1) || { echo "$out"; exit 1; }
 done
+scripts/typecheck

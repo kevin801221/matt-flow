@@ -170,16 +170,26 @@ cd ~/matt-flow
 git config core.hooksPath .githooks
 claude plugin validate .
 claude plugin test .
+scripts/typecheck
 ```
 
-`git config core.hooksPath .githooks` 每個 clone 執行一次：之後每次 commit 前都會自動跑 validate 和測試，沒通過就不能 commit，你和 Claude 都一樣。
+`git config core.hooksPath .githooks` 每個 clone 執行一次：之後每次 commit 前都會自動跑 validate、測試和型別檢查，沒通過就不能 commit，你和 Claude 都一樣。型別檢查要用到 Claude Code 的型別檔，它只在某個 session 載入過 plugin-authoring skill 之後才會出現；找不到時，`scripts/typecheck` 會說明並略過。
 
-部署：先 push，再讓 skills 資料夾從 GitHub 拉新版，所有開著的 session 會立刻換成新版。先 push 是為了讓 GitHub 上一直有一份備份，不會只剩你電腦上那一份。部署前也可以先備份進度紀錄，也就是 `~/.claude/plugins/store/` 底下 `matt-flow_` 開頭的 JSON 檔。
+部署：先 push，再讓 skills 資料夾從 GitHub 拉新版，所有開著的 session 會立刻換成新版。先 push 是為了讓 GitHub 上一直有一份備份，不會只剩你電腦上那一份。部署前也可以先備份進度，也就是 `~/.claude/plugins/store/` 底下 `matt-flow_` 開頭的 JSON 檔。
 
 ```bash
 git -C ~/matt-flow push origin main
 git -C ~/.claude/skills/matt-flow pull --ff-only
 ```
+
+部署之後，確認新版真的載入了、hook 沒有被其他外掛跳過。排在 matt-flow 前面的外掛，測試看不到，只有真的跑一次才知道（會花一次很小的 Haiku 呼叫）：
+
+```bash
+cd /tmp && claude -p --debug --debug-file /tmp/matt-flow.log --model claude-haiku-5-5 "Reply with just: ok"
+grep matt-flow /tmp/matt-flow.log | grep -E 'loaded|bypassed|fail'
+```
+
+應該只看到一行 `loaded`；出現 `bypassed by` 就是那個 hook 沒在跑。想知道引擎其他的實際行為（例如外掛讀得到哪些對話內容），也可以照這個做法，用一個臨時外掛跑 `claude -p --plugin-dir <資料夾>`。
 
 部署壞了就退回上一版：
 
