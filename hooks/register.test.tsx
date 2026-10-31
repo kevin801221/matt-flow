@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 import type { TestBody } from 'claude-code/testing'
-import type { FsEntry, UiPane } from 'claude-code'
+import type { FsEntry, SessionMessage, UiPane } from 'claude-code'
 
 const REPO = '/repo'
 
@@ -35,11 +35,15 @@ type World = {
   files?: Record<string, string>
   // What an earlier version left in the store for this project.
   stored?: unknown
+  // Other projects' progress in the same store, by their roots.
+  others?: Record<string, unknown>
 }
+
+const DAY = 86_400_000
 
 // Stands for the engine beneath the plugin. The files given predate the
 // session; those `write` adds come later, newer than anything the plugin timed.
-const engine = (on: Parameters<TestBody>[1], { files = SKILLS_REPO, stored }: World = {}) => {
+const engine = (on: Parameters<TestBody>[1], { files = SKILLS_REPO, stored, others = {} }: World = {}) => {
   const disk = new Map(Object.entries(files).map(([path, text]) => [path, { text, mtimeMs: 0 }]))
   const rel = (path: string) => (path.startsWith(`${REPO}/`) ? path.slice(REPO.length + 1) : path)
   const filled: { text: string; mode?: string }[] = []
@@ -65,7 +69,11 @@ const engine = (on: Parameters<TestBody>[1], { files = SKILLS_REPO, stored }: Wo
     return { value: undefined }
   })
   on('session.usage', () => ({ value: { startedAt: 0, context: { tokens: 50_000, window: 200_000 }, rateLimits: [] } }))
-  on('clock.now', () => ({ value: 1 }))
+  let now = 1
+  on('clock.now', () => ({ value: now }))
+  // The conversation the model holds: a test compacts, clears or rewinds it by hand.
+  const conversation: SessionMessage[] = []
+  on('session.messages', () => ({ value: conversation }))
   on('fs.read', (_, e) => ({ value: disk.get(rel(e.path))?.text ?? '' }))
   on('fs.exists', (_, e) => ({ value: disk.has(rel(e.path)) }))
   on('fs.list', (_, e) => {
@@ -81,7 +89,11 @@ const engine = (on: Parameters<TestBody>[1], { files = SKILLS_REPO, stored }: Wo
     return { value: [...entries.values()] }
   })
   // The plugin's one store file, which every session of the plugin reads and writes.
-  const store = new Map<string, unknown>(stored === undefined ? [] : [[`progress:${REPO}`, stored]])
+  const store = new Map<string, unknown>([
+    ...(stored === undefined ? [] : [[`progress:${REPO}`, stored] as const]),
+    ...Object.entries(others).map(([root, saved]) => [`progress:${root}`, saved] as const),
+  ])
+  on('store.keys', () => ({ value: [...store.keys()] }))
   on('store.get', (_, e) => ({ value: store.get(e.key) }))
   on('store.set', (_, e) => {
     store.set(e.key, JSON.parse(JSON.stringify(e.value)))
@@ -99,12 +111,20 @@ const engine = (on: Parameters<TestBody>[1], { files = SKILLS_REPO, stored }: Wo
     return { isShown: true }
   })
   on('turn.complete', () => ({ text: '' }))
-  on('session.compact', (_, e) => ({ messages: e.messages }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('prompt.submit', (_, e) => ({ text: e.text, context: e.context }))
   on('tool.call', () => ({ result: {} }))
 
-  return { filled, suggested, toasts, store, write: (path: string, text = '') => void disk.set(path, { text, mtimeMs: 2 }) }
+  return {
+    filled,
+    suggested,
+    toasts,
+    store,
+    conversation,
+    write: (path: string, text = '') => void disk.set(path, { text, mtimeMs: 2 }),
+    // Moves the clock to `ms`.
+    at: (ms: number) => void (now = ms),
+  }
 }
 
 const start = ($: Engine) => $.session.start({ cwd: REPO, surface: 'terminal', isInteractive: true })
@@ -206,8 +226,39 @@ test('stuck puts /ask-matt with where the person is into the prompt box, keeping
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   await ui.press({ key: 'stuck' })
   expect(filled).toEqual([
-    { text: '/ask-matt 我在 Matt 導航的「新手」流程，卡在「把想法問清楚」(/grill-with-docs)。我遇到的狀況是：', mode: 'insert' },
+    {
+      text: '/ask-matt 我在 Matt 導航的「新手」流程，卡在「把想法問清楚」(/grill-with-docs)。沒有跳過步驟。現在會被擋：改程式碼（Edit、Write、NotebookEdit）。我遇到的狀況是：',
+      mode: 'insert',
+    },
   ])
+  await ui.unmount()
+})
+
+test('in a project the rail is quiet in, stuck tells /ask-matt nothing is locked', async ($, on) => {
+  const { filled } = engine(on, { files: {} })
+  await start($)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'stuck' })
+  expect(filled.at(-1)?.text).toBe(
+    '/ask-matt 我在 Matt 導航的「新手」流程，卡在「設定專案」(/setup-matt-pocock-skills)。沒有跳過步驟。現在沒有會被擋的動作。我遇到的狀況是：',
+  )
+  await ui.unmount()
+})
+
+test('stuck tells /ask-matt the steps skipped, what is locked, and how long the project has been left', async ($, on) => {
+  const { filled, at } = engine(on)
+  at(0)
+  await start($)
+  await typed($, 'grill-with-docs')
+  await flow($, 'skip')
+  at(4 * DAY)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'stuck' })
+  expect(filled.at(-1)?.text).toBe(
+    '/ask-matt 我在 Matt 導航的「新手」流程，卡在「檢查」(/code-review)。跳過了「動手做」。現在會被擋：git commit。4 天沒動。我遇到的狀況是：',
+  )
   await ui.unmount()
 })
 
@@ -629,6 +680,17 @@ test('with no feature, the rail says code is locked behind /grill-with-docs, wha
   expect(text).toMatch(/Bash/)
 })
 
+test("the rail lets Claude name Matt's ways in when no feature is under way or the person asks what to do", async ($, on) => {
+  engine(on)
+  await start($)
+
+  const text = await rail($)
+  expect(text).toMatch(/沒有進行中的功能、或人問該怎麼辦時，可以點名 Matt 的入口/)
+  for (const entry of ['/triage', '/diagnosing-bugs', '/wayfinder', '/improve-codebase-architecture', '/to-questionnaire']) {
+    expect(text).toContain(entry)
+  }
+})
+
 test('once the spec is written, the rail names the feature and points at /to-tickets', async ($, on) => {
   const { write } = engine(on, { stored: { level: 'intermediate' } })
   await start($)
@@ -675,12 +737,34 @@ test('while grilling, the rail names building as the next step, never as the ste
   expect(text).not.toMatch(/目前的步驟/)
 })
 
+const message = (role: 'user' | 'assistant', text: string): SessionMessage => ({ role, text, toolUses: [] })
+
 test('once the conversation is compacted, the next prompt carries the rail again', async ($, on) => {
-  engine(on)
+  const { conversation } = engine(on)
   await start($)
   await said($, 'hi')
-  await $.session.compact({ trigger: 'manual', messages: [{ role: 'user', text: 'hi', toolUses: [] }] })
+  conversation.push(message('user', 'hi'), message('assistant', 'hello'))
+  await turnEnds($)
+  expect(await said($, 'and again')).toEqual([])
 
+  // A compaction puts its summary first; the conversation need not get any shorter.
+  conversation.splice(0, 1, message('user', 'This session is being continued from a previous conversation.'))
+  expect(await rail($)).toMatch(/# matt-flow 軌道/)
+})
+
+test('a rewind or /clear takes the rail away, and the next prompt carries it again', async ($, on) => {
+  const { conversation } = engine(on)
+  await start($)
+  await said($, 'hi')
+  conversation.push(message('user', 'hi'), message('assistant', 'hello'))
+  await turnEnds($)
+  conversation.push(message('user', 'more'), message('assistant', 'sure'))
+  await turnEnds($)
+
+  conversation.splice(2)
+  expect(await rail($)).toMatch(/# matt-flow 軌道/)
+  expect(await said($, 'and again')).toEqual([])
+  conversation.splice(0)
   expect(await rail($)).toMatch(/# matt-flow 軌道/)
 })
 
@@ -768,6 +852,66 @@ test('/matt-flow end, or skipping the retro, ends the feature', async ($, on) =>
 
   for (const step of ['把想法問清楚', '動手做', '檢查']) expect(await flow($, 'skip')).toMatch(step)
   expect(await flow($, 'skip')).toBe('🎉 功能結束，已完成 2 個功能 → 下一個從 /grill-with-docs 開始')
+})
+
+test('/matt-flow all lists every project with progress, the longest left first, and marks a feature left over 3 days', async ($, on) => {
+  const { at } = engine(on, {
+    others: {
+      '/Users/me/billing': {
+        level: 'intermediate',
+        steps: { grill: 'passed', spec: 'passed' },
+        feature: { name: 'invoices', since: 0 },
+        isReviewed: false,
+        isOff: false,
+        features: 2,
+      },
+      '/Users/me/finished': { level: 'beginner', steps: {}, feature: null, isReviewed: false, isOff: false, features: 1 },
+      '/private/tmp/scratch': { level: 'beginner', steps: {}, feature: null, isReviewed: false, isOff: false, features: 0 },
+    },
+  })
+  at(5 * DAY)
+  await start($)
+  await typed($, 'grill-with-docs')
+
+  expect(await flow($, 'all')).toBe(
+    [
+      '⚠ ~/billing · 🚀 進階 · 功能「invoices」進行中 · 下一步 /to-tickets · 5 天沒動',
+      '  /repo · 🌱 新手 · 功能進行中 · 下一步 /implement · 不到 1 天沒動',
+      '  ~/finished · 🌱 新手 · 還沒有進行中的功能 · 下一步 /grill-with-docs · 已完成 1 個功能',
+      '最近 7 天結束的功能：沒有',
+    ].join('\n'),
+  )
+})
+
+test('a feature ended in the last 7 days shows under the overview, with how long it took and what it skipped', async ($, on) => {
+  const { at } = engine(on)
+  at(DAY)
+  await start($)
+  await typed($, 'grill-with-docs')
+  await flow($, 'skip')
+  at(3 * DAY)
+  await flow($, 'end')
+
+  const ended = async () => (await flow($, 'all'))?.split('\n').at(-1)
+  expect(await ended()).toBe('最近 7 天結束的功能：/repo（2 天，跳過「動手做」）')
+  at(11 * DAY)
+  expect(await ended()).toBe('最近 7 天結束的功能：沒有')
+})
+
+test('a skill that moves nothing, a level change, or the rail turned off and on leaves the time the flow last moved', async ($, on) => {
+  const { at } = engine(on)
+  at(0)
+  await start($)
+  await typed($, 'grill-with-docs')
+  at(4 * DAY)
+  await $.tool.call({ tool: 'Skill', skill: 'mattpocock-skills:grilling' })
+  await flow($, 'off')
+  await flow($, 'on')
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'level-intermediate' })
+  await ui.unmount()
+
+  expect((await flow($, 'all'))?.split('\n')[0]).toBe('⚠ /repo · 🚀 進階 · 功能進行中 · 下一步 /to-spec · 4 天沒動')
 })
 
 test('/matt-flow off quiets the gates and takes the rail back in this project; on brings them back', async ($, on) => {

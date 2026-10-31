@@ -3,6 +3,9 @@ export type Level = 'beginner' | 'intermediate' | 'expert'
 // A step with no state has not passed yet.
 export type StepState = 'passed' | 'skipped'
 
+// A feature record: a feature as it ended, its skipped steps by their keys.
+export type FeatureRecord = { name: string | null; since: number; end: number; skipped: string[] }
+
 // One project's progress, kept across sessions under the project's root.
 export type Progress = {
   level: Level
@@ -20,6 +23,10 @@ export type Progress = {
   isWrappingUp: boolean
   // Features finished before this one.
   features: number
+  // Their records since 0.5, oldest first.
+  records: FeatureRecord[]
+  // When the flow last moved on, null until it does after 0.5: how long the project has been idle.
+  movedAt: number | null
 }
 
 declare module 'claude-code' {

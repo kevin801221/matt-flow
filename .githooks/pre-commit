@@ -1,0 +1,7 @@
+#!/bin/sh
+# Validates the mod and runs its tests before each commit, quiet unless one fails.
+# A clone turns it on once: git config core.hooksPath .githooks
+# ponytail: checks the working tree, not only what is staged; stash the rest first when the two differ.
+for check in validate test; do
+  out=$(claude plugin "$check" . 2>&1) || { echo "$out"; exit 1; }
+done
